@@ -1,0 +1,35 @@
+# Safe, file-based SSD benchmark template.
+# Replace filename with a dedicated mounted data-disk directory. Never use a
+# raw device such as /dev/vda or /dev/nvme0n1 for this smoke test.
+[global]
+ioengine=libaio
+direct=1
+time_based=1
+runtime=30
+group_reporting=1
+size=1G
+directory=/mnt/epc-insta-fio
+
+[seqread]
+rw=read
+bs=1M
+iodepth=32
+numjobs=1
+
+[seqwrite]
+rw=write
+bs=1M
+iodepth=32
+numjobs=1
+
+[randread]
+rw=randread
+bs=4k
+iodepth=32
+numjobs=4
+
+[randwrite]
+rw=randwrite
+bs=4k
+iodepth=32
+numjobs=4

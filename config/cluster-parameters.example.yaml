@@ -1,0 +1,22 @@
+# 这是部署前需要从阿里云控制台补齐的参数表，不是可直接提交的云 API 请求。
+region: cn-<region>
+zone: cn-<region>-<zone>
+vpc_id: vpc-<replace>
+vswitch_id: vsw-<replace>
+security_group_id: sg-<replace>
+key_pair_name: <replace>
+nas_file_system_id: <replace-or-null>
+nas_mount_target: <replace-or-null>
+oss_bucket: oss://<private-bucket>
+image_id: aliyun-linux-3-or-arc-image-id
+management_node:
+  instance_type: <general-purpose-small>
+  count: 1
+compute_nodes:
+  instance_type: <epc-insta-compatible-type>
+  count: 1
+  max_count: 8
+scheduler: slurm
+container_image: <registry>/<namespace>/epc-insta-test:<immutable-tag>
+shared_mount: /shared
+epc_insta_command: <replace-with-real-command>

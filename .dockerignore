@@ -1,0 +1,6 @@
+.git
+.github
+work
+__pycache__
+*.json
+*.log
