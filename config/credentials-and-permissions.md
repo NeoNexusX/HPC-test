@@ -13,6 +13,14 @@
 
 ACR 侧需要先创建目标命名空间和仓库，并给推送账号授权目标仓库的拉取和推送权限。推送账号不需要管理 VPC、E-HPC、OSS 或 NAS。
 
+## GitHub Actions 自动测试 OSS
+
+测试 job 还需要以下 Repository secrets 和 Variables：
+
+Secrets：`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`；如果使用 STS 临时凭证，再配置 `OSS_SESSION_TOKEN`。
+
+Variables：`OSS_BUCKET`、`OSS_PREFIX`、`OSS_REGION`、`EPC_SSD_DIR`、`SSD_TEST_SIZE`、`SSD_TEST_RUNTIME`。OSS 账号只需要目标 Bucket 的对象读、写、删权限；不要使用主账号 AccessKey。
+
 ## E-HPC 节点拉取 ACR
 
 GitHub Actions 的推送凭证只用于 GitHub Runner，不能自动让 E-HPC 节点获得拉取权限。E-HPC 节点需要单独配置以下任一方式：

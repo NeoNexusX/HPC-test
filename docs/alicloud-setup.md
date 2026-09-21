@@ -75,13 +75,16 @@ logs/
 artifacts/
 ```
 
-OSS 测试使用 `ossutil`，脚本会生成临时文件、上传、下载、输出上传/下载速度和 SHA-256 校验结果，并默认删除临时对象。节点需要先安装阿里云官方 `ossutil`，完成登录或绑定 RAM 角色：
+OSS 测试使用容器镜像内的阿里云官方 `ossutil`，脚本会生成临时文件、上传、下载、输出上传/下载速度和 SHA-256 校验结果，并默认删除临时对象。宿主机不需要另行安装 `ossutil`；自动化测试通过 GitHub Secrets 传入 OSS 凭证，或由 E-HPC runner 使用等价的 RAM 角色：
 
 ```bash
 export OSS_TEST_URI=oss://<bucket>/results/oss-smoke-${HOSTNAME}.bin
-python3 scripts/epc_insta_smoke.py \
+docker run --rm \
+  -e OSS_ACCESS_KEY_ID -e OSS_ACCESS_KEY_SECRET -e OSS_SESSION_TOKEN -e OSS_REGION \
+  -v /data:/data -v /tmp:/work \
+  <ACR_REGISTRY>/<ACR_NAMESPACE>/epc-insta-test:<tag> \
   --oss-test --oss-size 64M --oss-uri "$OSS_TEST_URI" \
-  --out /tmp/oss-result.json
+  --out /work/oss-result.json
 cat /tmp/oss-result.json
 ```
 
@@ -108,12 +111,15 @@ cat /tmp/oss-result.json
 ## 7. 节点验证
 
 ```bash
-python3 scripts/epc_insta_smoke.py --out /tmp/baseline.json
-python3 scripts/epc_insta_smoke.py --ssd-test --ssd-dir /data \
-  --ssd-size 1G --ssd-runtime 30 --out /tmp/ssd.json
 export OSS_TEST_URI=oss://<bucket>/results/oss-smoke-${HOSTNAME}.bin
-python3 scripts/epc_insta_smoke.py --oss-test --oss-uri "$OSS_TEST_URI" \
-  --oss-size 64M --out /tmp/oss.json
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -e OSS_ACCESS_KEY_ID -e OSS_ACCESS_KEY_SECRET -e OSS_SESSION_TOKEN -e OSS_REGION \
+  -v /data:/data -v /tmp:/work \
+  <ACR_REGISTRY>/<ACR_NAMESPACE>/epc-insta-test:<tag> \
+  --ssd-test --ssd-dir /data --ssd-size 1G --ssd-runtime 30 \
+  --oss-test --oss-uri "$OSS_TEST_URI" --oss-size 64M \
+  --out /work/epc-insta-result.json
 ```
 
 双节点 Slurm 测试只验证节点调度和应用运行，不测试 NAS：

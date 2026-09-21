@@ -50,3 +50,66 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  run-tests-on-ehpc:
+    name: Run SSD and OSS tests on E-HPC
+    needs: build-and-push
+    # Install a GitHub self-hosted runner on the E-HPC test node and add these labels.
+    runs-on: [self-hosted, linux, e-hpc]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Pull image and run SSD/OSS tests
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_SESSION_TOKEN: ${{ secrets.OSS_SESSION_TOKEN }}
+          OSS_BUCKET: ${{ vars.OSS_BUCKET }}
+          OSS_PREFIX: ${{ vars.OSS_PREFIX }}
+          OSS_REGION: ${{ vars.OSS_REGION }}
+          EPC_SSD_DIR: ${{ vars.EPC_SSD_DIR }}
+          SSD_TEST_SIZE: ${{ vars.SSD_TEST_SIZE }}
+          SSD_TEST_RUNTIME: ${{ vars.SSD_TEST_RUNTIME }}
+        run: |
+          set -euo pipefail
+          : "${ACR_REGISTRY:?missing ACR_REGISTRY}"
+          : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
+          : "${OSS_BUCKET:?missing OSS_BUCKET repository variable}"
+          : "${OSS_REGION:?missing OSS_REGION repository variable}"
+          : "${EPC_SSD_DIR:?missing EPC_SSD_DIR runner variable}"
+          test -d "${EPC_SSD_DIR}"
+          mkdir -p "${RUNNER_TEMP}/epc-results"
+
+          image="${ACR_REGISTRY}/${ACR_NAMESPACE}/epc-insta-test:${GITHUB_SHA:0:7}"
+          printf '%s' "${ACR_PASSWORD}" | docker login "${ACR_REGISTRY}" \
+            --username "${ACR_USERNAME}" --password-stdin
+          docker pull "${image}"
+
+          object_uri="oss://${OSS_BUCKET}/${OSS_PREFIX:-epc-insta/github}/${GITHUB_REPOSITORY//\//-}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.bin"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=${EPC_SSD_DIR},dst=/data" \
+            --mount "type=bind,src=${RUNNER_TEMP}/epc-results,dst=/work" \
+            --env OSS_ACCESS_KEY_ID \
+            --env OSS_ACCESS_KEY_SECRET \
+            --env OSS_SESSION_TOKEN \
+            --env OSS_REGION \
+            "${image}" \
+            --ssd-test --ssd-dir /data \
+            --ssd-size "${SSD_TEST_SIZE:-1G}" \
+            --ssd-runtime "${SSD_TEST_RUNTIME:-30}" \
+            --oss-test --oss-uri "${object_uri}" --oss-size 64M \
+            --out /work/epc-insta-result.json
+
+      - name: Upload test result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epc-insta-test-${{ github.run_id }}
+          path: ${{ runner.temp }}/epc-results/epc-insta-result.json
+          if-no-files-found: warn

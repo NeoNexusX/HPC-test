@@ -2,7 +2,7 @@
 """E-HPC/EPC Insta smoke test.
 
 The baseline uses only the Python standard library. Optional SSD and OSS
-checks use the fio and ossutil executables installed on the node.
+checks use the fio and ossutil executables supplied by the runtime image.
 """
 
 from __future__ import annotations

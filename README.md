@@ -73,7 +73,7 @@ VPC/vSwitch/安全组解决“节点怎么安全联网”；OSS 解决“数据�
 4. **镜像**：先用阿里云官方 Linux 镜像验证集群；如果控制台确实提供 ARC 镜像，再在隔离测试集群中验证 ARC 镜像的驱动、Python、容器运行时和 Slurm 兼容性。
 5. **节点规格**：管理节点使用通用型小规格；计算节点按 EPC Insta 的 CPU/内存/GPU/网络需求选择，并从 1 个节点开始。
 6. **节点数量**：先固定 1 个管理节点 + 1 个计算节点；单节点通过后再扩展到 2、4、8 个计算节点。
-7. **初始化脚本**：在节点启动阶段安装 Docker/Podman（若镜像已预装则跳过）、安装 FIO 和 ossutil、拉取测试镜像、创建 `/opt/epc-insta-test`。
+7. **初始化脚本**：在节点启动阶段准备 Docker/Podman（若镜像已预装则跳过）、拉取 ACR 测试镜像、创建 `/opt/epc-insta-test`。FIO 和 ossutil 已包含在本方案的容器镜像中。
 8. **日志**：启用云监控/日志服务，至少采集 Slurm、系统、容器 stdout/stderr 和任务退出码。
 
 ### ARC 镜像结论
@@ -115,7 +115,7 @@ docker build -f .\image\Dockerfile -t epc-insta-test:py311 .
 docker run --rm -v "${PWD}\work:/work" epc-insta-test:py311
 ```
 
-Dockerfile 当前安装 Python 3.11、FIO，并读取 `image/requirements.txt` 安装 Python 依赖。如果 EPC Insta 在私有仓库，先登录镜像仓库，再通过 `requirements.txt` 或派生 Dockerfile 安装/复制程序。不要把仓库密码写进 Dockerfile。
+Dockerfile 当前安装 Python 3.11、FIO、阿里云官方 ossutil 2.4.0，并读取 `image/requirements.txt` 安装 Python 依赖。如果 EPC Insta 在私有仓库，先登录镜像仓库，再通过 `requirements.txt` 或派生 Dockerfile 安装/复制程序。不要把仓库密码写进 Dockerfile。
 
 ### 4.3 文件型 SSD 测试
 
@@ -144,7 +144,7 @@ fio /tmp/epc-insta.fio --output-format=json \
 
 ### 4.4 OSS 上传/下载速度测试
 
-OSS 测试使用节点上的阿里云官方 `ossutil`，不把 AccessKey 写进脚本。先让节点通过 RAM 角色或 `ossutil` 配置获得目标 Bucket 的读写权限，然后执行：
+OSS 测试使用容器镜像内的阿里云官方 `ossutil`，不需要在宿主机另行安装。通过 GitHub Secrets 传入 OSS 测试凭证，或在 E-HPC 节点使用等价的 RAM 角色，然后执行：
 
 ```bash
 export OSS_TEST_URI=oss://<bucket>/results/oss-smoke-${HOSTNAME}.bin
@@ -217,7 +217,7 @@ docker run --rm --user 10001 \
   <ACR_REGISTRY>/<ACR_NAMESPACE>/epc-insta-test:<git-sha-or-version>
 ```
 
-ACR 负责容器镜像分发，E-HPC 节点镜像仍负责操作系统、驱动和 Slurm 环境；二者不要混成一个镜像层次。
+ACR 负责容器镜像分发，E-HPC 节点镜像仍负责操作系统、驱动、Slurm 和 GitHub self-hosted runner；二者不要混成一个镜像层次。推送到 `main` 后，工作流会先构建/推送镜像，再在带有 `self-hosted, linux, e-hpc` 标签的 E-HPC runner 上自动执行 SSD 和 OSS 测试，并上传 JSON 结果 artifact。
 
 ## 7. 结果判定和扩容顺序
 
