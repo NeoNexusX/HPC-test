@@ -9,7 +9,7 @@ packages:
   - python3
   - fio
 runcmd:
-  - [ bash, -lc, "mkdir -p /opt/epc-insta-test/results /data/epc-insta-fio" ]
+  - [ bash, -lc, "mkdir -p /opt/epc-insta-test /shared/results" ]
   - [ bash, -lc, "mkdir -p /mnt/epc-insta-fio" ]
   - [ bash, -lc, "test -x /usr/bin/docker && systemctl enable --now docker || true" ]
   - [ bash, -lc, "echo ready > /opt/epc-insta-test/node-ready" ]

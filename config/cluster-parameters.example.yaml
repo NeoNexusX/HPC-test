@@ -17,6 +17,11 @@ compute_nodes:
   count: 1
   max_count: 8
 scheduler: slurm
-container_image: <registry>/<namespace>/epc-insta-test:<immutable-tag>
+container_image: ghcr.io/<github-owner>/<github-repo>/epc-insta-test:<immutable-tag>
 shared_mount: /shared
 epc_insta_command: <replace-with-real-command>
+oss_result_prefix: oss://<private-bucket>/results
+oss_client: ossutil
+executor_script: /shared/epc-insta-test/scripts/run_epc_job.sh
+container_registry: ghcr.io
+container_registry_visibility: public-or-private

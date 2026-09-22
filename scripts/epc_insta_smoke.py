@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """E-HPC/EPC Insta smoke test.
 
-The baseline uses only the Python standard library. Optional SSD and OSS
-checks use the fio and ossutil executables supplied by the runtime image.
+The script intentionally has no third-party dependency so it can run on a
+fresh E-HPC login/compute node or inside the accompanying image.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 import platform
-import re
 import shutil
 import socket
 import subprocess
@@ -92,116 +91,6 @@ def file_check(path: Path) -> dict:
     return {"path": str(path), "bytes": len(payload), "sha256": digest, "pass": True}
 
 
-def parse_size(value: str) -> int:
-    """Parse a small human-readable size such as 64M or 1G."""
-    units = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    normalized = value.strip().upper()
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KMGT]?B?)?", normalized)
-    if not match:
-        raise ValueError(f"invalid size: {value}")
-    number, suffix = match.groups()
-    suffix = suffix or "B"
-    suffix = suffix.rstrip("B") or "B"
-    if suffix not in units:
-        raise ValueError(f"unsupported size suffix: {suffix}")
-    amount = float(number)
-    if amount <= 0:
-        raise ValueError("size must be positive")
-    return int(amount * units[suffix])
-
-
-def write_payload(path: Path, size_bytes: int) -> str:
-    digest = hashlib.sha256()
-    chunk_size = 1024 * 1024
-    remaining = size_bytes
-    with path.open("wb") as stream:
-        while remaining:
-            chunk = os.urandom(min(chunk_size, remaining))
-            stream.write(chunk)
-            digest.update(chunk)
-            remaining -= len(chunk)
-    return digest.hexdigest()
-
-
-def run_oss_test(
-    oss_uri: str,
-    size: str,
-    timeout: int,
-    ossutil_bin: str | None,
-    keep_object: bool,
-) -> dict:
-    """Measure ossutil upload/download speed for one temporary object."""
-    if not oss_uri.startswith("oss://") or any(char.isspace() for char in oss_uri):
-        return {"pass": False, "error": "--oss-uri must be an oss:// URI without whitespace"}
-    ossutil = ossutil_bin or shutil.which("ossutil")
-    if not ossutil:
-        return {"pass": False, "error": "ossutil is not installed or not in PATH"}
-    try:
-        size_bytes = parse_size(size)
-    except ValueError as exc:
-        return {"pass": False, "error": str(exc)}
-
-    with tempfile.TemporaryDirectory(prefix="epc-oss-") as temp_dir:
-        temp_root = Path(temp_dir)
-        upload_file = temp_root / "payload.bin"
-        download_file = temp_root / "download.bin"
-        expected_sha256 = write_payload(upload_file, size_bytes)
-        upload_started = time.perf_counter()
-        upload = run_argv(
-            [ossutil, "cp", str(upload_file), oss_uri, "--force"],
-            timeout,
-        )
-        upload_elapsed = time.perf_counter() - upload_started
-        if upload["pass"]:
-            download_started = time.perf_counter()
-            download = run_argv(
-                [ossutil, "cp", oss_uri, str(download_file), "--force"],
-                timeout,
-            )
-            download_elapsed = time.perf_counter() - download_started
-        else:
-            download = {"pass": False, "error": "upload failed; download skipped"}
-            download_elapsed = 0.0
-
-        cleanup = {"pass": True, "skipped": keep_object}
-        if not keep_object:
-            cleanup = run_argv([ossutil, "rm", oss_uri, "--force"], timeout)
-
-        downloaded_size = download_file.stat().st_size if download_file.exists() else 0
-        downloaded_sha256 = (
-            hashlib.sha256(download_file.read_bytes()).hexdigest()
-            if download_file.exists()
-            else None
-        )
-        download["bytes"] = downloaded_size
-        download["sha256"] = downloaded_sha256
-        download["sha256_match"] = downloaded_sha256 == expected_sha256
-        download["pass"] = bool(download.get("pass")) and download["sha256_match"]
-        upload_speed = size_bytes / upload_elapsed if upload["pass"] and upload_elapsed else 0
-        download_speed = downloaded_size / download_elapsed if download["pass"] and download_elapsed else 0
-        return {
-            "pass": upload["pass"] and download["pass"],
-            "ossutil": ossutil,
-            "uri": oss_uri,
-            "bytes": size_bytes,
-            "size": size,
-            "sha256": expected_sha256,
-            "upload": {
-                **upload,
-                "bytes": size_bytes,
-                "speed_bytes_per_sec": round(upload_speed, 2),
-                "speed_mbps": round(upload_speed / 1024**2, 2),
-            },
-            "download": {
-                **download,
-                "speed_bytes_per_sec": round(download_speed, 2),
-                "speed_mbps": round(download_speed / 1024**2, 2),
-            },
-            "cleanup": cleanup,
-            "keep_object": keep_object,
-        }
-
-
 def run_fio_test(ssd_dir: Path, size: str, runtime: int, timeout: int) -> dict:
     """Run safe file-based FIO profiles; never target a raw block device."""
     fio = shutil.which("fio")
@@ -279,7 +168,13 @@ def run_fio_test(ssd_dir: Path, size: str, runtime: int, timeout: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="smoke-result.json")
+    parser.add_argument("--shared-dir", default=os.getenv("EPC_SHARED_DIR", "/shared"))
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--require-shared",
+        action="store_true",
+        help="fail when --shared-dir is absent/not writable (recommended on E-HPC)",
+    )
     parser.add_argument(
         "--ssd-test",
         action="store_true",
@@ -288,12 +183,6 @@ def main() -> int:
     parser.add_argument("--ssd-dir", default=os.getenv("EPC_SSD_DIR", "/mnt"))
     parser.add_argument("--ssd-size", default=os.getenv("EPC_SSD_SIZE", "1G"))
     parser.add_argument("--ssd-runtime", type=int, default=int(os.getenv("EPC_SSD_RUNTIME", "30")))
-    parser.add_argument("--oss-test", action="store_true", help="measure ossutil upload/download speed")
-    parser.add_argument("--oss-uri", default=os.getenv("OSS_TEST_URI"))
-    parser.add_argument("--oss-size", default=os.getenv("OSS_TEST_SIZE", "64M"))
-    parser.add_argument("--ossutil-bin", default=os.getenv("OSSUTIL_BIN"))
-    parser.add_argument("--oss-timeout", type=int, default=int(os.getenv("OSS_TEST_TIMEOUT", "900")))
-    parser.add_argument("--oss-keep-object", action="store_true")
     args = parser.parse_args()
 
     checks: dict[str, object] = {}
@@ -310,9 +199,20 @@ def main() -> int:
         temp_path = Path(temp_dir) / "write-check.bin"
         checks["local_io"] = file_check(temp_path)
 
+    shared = Path(args.shared_dir)
+    if shared.is_dir() and os.access(shared, os.W_OK):
+        checks["shared_io"] = file_check(shared / f"smoke-{socket.gethostname()}.txt")
+    else:
+        checks["shared_io"] = {
+            "path": str(shared),
+            "pass": not args.require_shared,
+            "skipped": not args.require_shared,
+            "error": "shared directory is absent or not writable",
+        }
+
     checks["tools"] = {
         name: shutil.which(name)
-        for name in ("python", "docker", "podman", "fio", "ossutil", "srun", "sbatch")
+        for name in ("python", "docker", "podman", "fio", "srun", "sbatch")
     }
 
     if args.ssd_test:
@@ -322,18 +222,6 @@ def main() -> int:
             args.ssd_runtime,
             max(args.timeout, args.ssd_runtime * 6),
         )
-
-    if args.oss_test:
-        if not args.oss_uri:
-            checks["oss"] = {"pass": False, "error": "--oss-uri or OSS_TEST_URI is required"}
-        else:
-            checks["oss"] = run_oss_test(
-                args.oss_uri,
-                args.oss_size,
-                args.oss_timeout,
-                args.ossutil_bin,
-                args.oss_keep_object,
-            )
 
     epc_command = os.getenv("EPC_INSTA_CMD")
     if epc_command:
@@ -362,3 +250,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
