@@ -1,0 +1,8 @@
+{
+  "Version": "1",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["oss:PutObject", "oss:GetObject", "oss:DeleteObject"],
+    "Resource": ["acs:oss:*:*:<your-bucket>/ehpc-benchmark/*"]
+  }]
+}

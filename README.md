@@ -1,274 +1,289 @@
-# E-HPC Instant + EPC Insta 测试落地方案
+# E-HPC INSTANT 基础设施测试
 
-本目录给出一套可先在本地验证、再迁移到阿里云 E-HPC Instant 的最小闭环：基础 Python 运行时镜像、单节点 smoke test、基于 FIO 的文件型 SSD 测试、Slurm 多节点测试入口、共享存储检查、云上配置清单，以及推送到 GitHub 后自动构建 GHCR 镜像的工作流。
-
-## 快速配置清单
-
-要让“本地触发 → E-HPC 执行 → 拉取镜像 → 测试 → OSS 归档”跑起来，最少需要配置以下内容：
-
-1. **GitHub**：把代码放到仓库的 `main` 分支；在仓库 `Settings > Actions > General` 将 Workflow permissions 设为允许读写。推送 `main` 后，`.github/workflows/build-and-push-ghcr.yml` 会自动生成 `ghcr.io/<owner>/<repo>/epc-insta-test:latest` 和 SHA 标签。
-2. **镜像内容**：把真实 EPC Insta 程序和依赖补进 `image/Dockerfile`、`image/requirements.txt`，并确认容器内命令可执行。当前镜像只包含测试框架，不包含你的业务程序。
-3. **E-HPC**：准备可 SSH 登录的 Slurm 登录节点；计算节点安装 Docker、能访问 `ghcr.io`，并把 NAS 挂载到 `/shared`。`sbatch` 用户需要有权限运行 Docker。
-4. **OSS**：创建私有 Bucket 和 `results/` 前缀；在计算节点安装并配置 `ossutil`，推荐给节点绑定 RAM Role。不要把 AccessKey 或 GitHub PAT 写入仓库、镜像或命令参数。
-5. **本地电脑**：准备 Python 3.10+、`ssh`、`scp`，以及登录节点私钥。首次使用 GHCR 私有镜像时，还要在计算节点配置 `REGISTRY=ghcr.io`、`REGISTRY_USERNAME`、`REGISTRY_PASSWORD`（仅 `read:packages` 权限）；公开 GHCR 镜像不需要登录。
-
-详细参数模板见 `config/cluster-parameters.example.yaml` 和 `config/github-ghcr.example.md`。
-
-## 0. 术语和假设
-
-本文把 **EPC Insta** 视为待验证的 EPC Insta 程序/服务（可执行文件、Python 包或容器），把 **ARC 镜像**视为你们内部或阿里云控制台中名为 ARC 的自定义镜像/镜像族。阿里云控制台的地域、实例族、镜像 ID 和产品命名会随账号、地域和发布时间变化，因此部署时必须以控制台实际可选项为准。
-
-E-HPC Instant 的公共基础设施建议采用：VPC + 交换机 + 安全组 + 登录密钥 + OSS/NAS 共享存储 + Slurm 调度器 + E-HPC 管理/计算节点。EPC Insta 应先在容器中跑通，再决定是否做成自定义云镜像。
-
-## 1. 推荐目标架构
+本地填好配置后，通过 HTTPS OpenAPI 向 E-HPC INSTANT 提交一个容器作业。容器里依次做 CPU 信息采集、FIO 磁盘测试和 OSS 上传/下载测速，把可读结果写进 `run.log`，再连同完整 JSON 一起上传到 OSS。不需要 SSH、Slurm、登录节点或 NAS。
 
 ```text
-管理员电脑
-    |
-    | SSH（只允许堡垒机/办公网段）
-    v
-VPC
-  ├─ 管理节点（E-HPC/Slurm controller、登录节点）
-  ├─ 计算节点 × N（EPC Insta 任务）
-  ├─ OSS：输入、测试结果和日志归档
-  └─ NAS：/shared，保存程序、数据集、日志
+① 代码 → 镜像（GitHub Actions，push 自动触发）
+   git push → 单元测试 → 构建镜像 → 镜像内冒烟测试 → 推送到 ACR 公网地址
+              crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:{latest, sha-<commit>}
+
+② 镜像 → 作业（本地执行 submit_instant.py）
+   读取 config/instant.local.json
+   → STS AssumeRole（临时凭证只允许写本次 run 的 OSS 前缀）
+   → INSTANT CreateJob，请求里包含：
+       Container.Image          = 配置里的 image（ACR 专有网络地址）
+       ImageRegistryOptions     = ACR_PULL_USERNAME / ACR_PULL_PASSWORD
+       EnvironmentVars          = OSS STS 临时凭证
+   → INSTANT 在你的香港 VPC 里用这组账号密码拉取镜像
+   → 运行 CPU / FIO / OSS 测试 → run.log 等结果上传 OSS
 ```
 
-建议把公网暴露面压到最小：管理节点使用私网，SSH 仅开放给固定办公 CIDR；计算节点只开放 VPC 内部通信。生产环境把登录节点放在堡垒机后面，并给 OSS/NAS 使用 RAM 角色而不是把 AccessKey 写进脚本或镜像。
+ACR 和 INSTANT 之间没有任何控制台层面的“绑定”，唯一的连接就是每次 `CreateJob` 请求里写的镜像地址和拉取凭证。Actions 只负责把镜像推上 ACR，不读取本地配置，也不会提交作业。
 
-### 这些云资源分别做什么
+### 配置放在哪里
 
-| 资源 | 作用 | 在本方案中的位置 |
+| 配置 | 位置 | 原因 |
 |---|---|---|
-| VPC | 你的云上私有网络，隔离节点和访问边界 | 放置 E-HPC 管理节点、计算节点和 NAS |
-| vSwitch | VPC 中按可用区划分的子网，分配私网 IP | 让节点在同一可用区内互通 |
-| 安全组 | 节点级虚拟防火墙 | 只开放 SSH、Slurm 和必要的应用端口 |
-| OSS | 对象存储，适合大文件、数据集和结果归档 | 保存 `datasets/`、`results/` 和日志 |
-| NAS | 共享文件系统，多个节点同时挂载读写 | 挂载到 `/shared`，放脚本、日志和任务结果 |
-| GHCR | 容器镜像仓库，版本化和分发测试镜像 | 推送 `main` 自动更新 `latest` |
+| ACR 镜像地址（公网）、命名空间、仓库名 | 仓库内 [.github/workflows/build-and-push-acr.yml](.github/workflows/build-and-push-acr.yml) 顶部 `env` | 不是秘密，Actions 构建推送需要 |
+| ACR 登录名、密码 | GitHub **Secrets**：`ACR_USERNAME`、`ACR_PASSWORD` | 密码不能进仓库 |
+| INSTANT 作业配置（地域、镜像、vSwitch、安全组、RAM 角色、Bucket、测试参数） | 本地 `config/instant.local.json`（被 `.gitignore` 排除） | 只有本地提交脚本用；本仓库是**公开**的，账号 ID、网络 ID 和 Bucket 名不宜公开 |
+| 阿里云 AccessKey、ACR 拉取密码 | 本地 `.env`（被 `.gitignore` 排除，提交脚本自动加载） | 秘密，不能进仓库，也不会打进镜像 |
 
-VPC/vSwitch/安全组解决“节点怎么安全联网”；NAS 解决“多个节点怎么看到同一目录”；OSS 解决“数据和结果怎么长期归档”；GHCR 解决“容器镜像怎么版本化和分发”。GHCR 不替代 VPC、NAS、OSS 或 E-HPC 节点镜像。
+`config/instant.local.json` 本身不含密码。如果把仓库改成私有，也可以把它提交进去；公开仓库下建议保留在本地。
 
-## 2. 阿里云准备项
+## 需求对照
 
-### 2.1 账号和配额
+| 需求 | 实现 | 说明 |
+|---|---|---|
+| 本地配置后提交作业 | `scripts/submit_instant.py`，官方 `EhpcInstant/2023-07-01` SDK 调 `CreateJob` / `GetJob` | `--dry-run` 不需要凭证，可先检查请求 |
+| OSS 上传、下载测速 | 单对象 PUT/GET，默认 1 GiB（`oss_size_mib: 1024`），记录耗时、MiB/s、SHA-256 校验，测完删除 | 单连接端到端吞吐，不是最大并发吞吐 |
+| 本地 SSD 测试（官方方法） | 8 组 FIO 负载，参数与[阿里云官方本地盘测试命令](https://www.alibabacloud.com/help/en/ecs/user-guide/test-the-performance-of-block-storage-devices)逐项一致 | 见下方“限制”：INSTANT 下测到的是容器所在磁盘 |
+| CPU 型号等 | `lscpu --json`：型号、厂商、架构、核数/线程、主频、L3、虚拟化；另记录 affinity 与 cgroup 限额 | 只采集信息，不做压力测试 |
+| 结果输出到日志并上传 OSS | `run.log` 逐行写可读结果；`result.json`、FIO 原始 JSON、`manifest.json` 一并上传 | 见“结果” |
+| push 自动构建并推送 ACR | `.github/workflows/build-and-push-acr.yml` | 所有分支 push、`v*` 标签、手动触发；PR 只构建不推送 |
 
-1. 选择一个支持 E-HPC Instant、目标计算实例族和目标镜像的地域/可用区。
-2. 通过 RAM 创建部署角色，至少覆盖 E-HPC、ECS、VPC、OSS、NAS、云监控和日志服务的最小权限；不要使用主账号 AccessKey。
-3. 提前检查 vCPU、实例数量、云盘、NAS 吞吐和 GPU（如果 EPC Insta 使用 GPU）配额。
-4. 创建密钥对，私钥只保存在管理员电脑；不要上传到 OSS 或写入镜像。
+## 一、需要你配置的内容（一次性）
 
-### 2.2 网络
+### 1. ACR 镜像仓库 + GitHub Secrets
 
-创建一个专用 VPC 和一个与计算节点同可用区的 vSwitch。安全组规则建议如下：
+1. 在[容器镜像服务 ACR](https://cr.console.aliyun.com/) 选择地域。**必须与 INSTANT 作业、OSS 在同一地域**，例如 `cn-hongkong`。
+2. 创建命名空间和镜像仓库：
+   - 仓库类型选私有。
+   - 代码源选**本地仓库**。“代码变更自动构建镜像”“海外机器构建”都不要勾选，构建交给 Actions。
+3. 在 ACR“访问凭证”里设置固定密码。这个密码不是阿里云网页登录密码，也不是 AccessKey。
+4. 如果仓库地址和当前不同，修改工作流顶部的 `ACR_REGISTRY`（公网域名）和 `ACR_IMAGE`（公网域名/命名空间/仓库名）。当前值为 `crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo`。
+5. 在 GitHub 仓库 **Settings → Secrets and variables → Actions → New repository secret** 添加：
 
-| 方向 | 协议/端口 | 来源/目标 | 用途 |
-|---|---|---|---|
-| 入站 | TCP 22 | 办公网段或堡垒机安全组 | 管理登录 |
-| 入站 | TCP 6817-6819 | VPC 安全组自身 | Slurm controller/agent |
-| 入站 | TCP/UDP 6000-6100 | VPC 安全组自身 | MPI/分布式运行时（按 EPC Insta 文档收窄） |
-| 出站 | TCP 443 | 0.0.0.0/0 或 NAT 网关 | 拉取镜像/依赖；生产可改为白名单 |
-| 入站 | 其他 | 拒绝 | 默认拒绝 |
+| Secret | 填什么 |
+|---|---|
+| `ACR_USERNAME` | ACR 仓库“操作指南”中 `docker login --username=` 后面的登录名（当前为 `NeoNexus`） |
+| `ACR_PASSWORD` | 第 3 步设置的访问凭证密码 |
 
-如果使用 RDMA/EFA 类网络或 GPU 通信，必须选择产品文档明确支持的实例族、镜像和驱动组合；不要仅凭普通 ECS 实例规格推断可用。
+push 后到 GitHub **Actions** 页查看。成功后 ACR 里会出现以下标签：
 
-### 2.3 存储
+- `latest`：仅默认分支（main），本地配置默认使用它，平时不用改配置。
+- `sha-<完整 40 位 commit SHA>`：每次提交都有。需要固定到某次构建时，把配置里的 `:latest` 换成它。
+- 分支名 / `v*` 标签名。
 
-* OSS：创建私有 Bucket，目录建议为 `artifacts/`、`datasets/`、`results/<run-id>/`；开启版本控制和服务端加密。
-* NAS：创建与 VPC 同地域的文件系统和挂载点，挂载到所有节点的 `/shared`。E-HPC 创建向导中若已提供共享存储选项，优先使用向导创建的挂载配置。
-* 云盘：管理节点保存系统和临时日志；计算节点使用按需临时盘，任务结果统一写 OSS/NAS。
+镜像里记录了构建时的 commit，`run.log` 第一行的 `image_git_sha=` 会显示本次测试实际用的是哪次提交。
 
-## 3. E-HPC Instant 集群配置
+### 2. OSS Bucket
 
-在控制台创建 E-HPC Instant 集群时按以下顺序填写：
+直接使用已有的 `official-oss`（中国香港，私有）。测试只会写入 `official-oss/ehpc-benchmark/<run-id>/...` 这个前缀：1 GB 的测速对象测完会删除，只留下日志和结果文件。
 
-1. **地域/可用区**：与 VPC、vSwitch、NAS 挂载点和 OSS 访问链路一致。
-2. **网络**：选择上一步创建的 VPC、vSwitch、安全组；关闭不需要的公网 IP，使用 NAT 或专用出网。
-3. **调度器**：选择 Slurm（或你账号已启用的等价调度器），记录 controller、登录节点和计算节点的主机名/IP。
-4. **镜像**：先用阿里云官方 Linux 镜像验证集群；如果控制台确实提供 ARC 镜像，再在隔离测试集群中验证 ARC 镜像的驱动、Python、容器运行时和 Slurm 兼容性。
-5. **节点规格**：管理节点使用通用型小规格；计算节点按 EPC Insta 的 CPU/内存/GPU/网络需求选择，并从 1 个节点开始。
-6. **节点数量**：先固定 1 个管理节点 + 1 个计算节点；单节点通过后再扩展到 2、4、8 个计算节点。
-7. **共享存储**：挂载 NAS 到 `/shared`，或者通过 OSSUtil/SDK 在任务前后同步数据。
-8. **初始化脚本**：在节点启动阶段安装 Docker/Podman（若镜像已预装则跳过）、安装 `ossutil`、创建 `/opt/epc-insta-test` 和 `/shared/results`。测试镜像由每次 Slurm 作业按参数拉取。
-9. **日志**：启用云监控/日志服务，至少采集 Slurm、系统、容器 stdout/stderr 和任务退出码。
+Bucket 概览里的“文件可以被公共访问”，意思是没有开启“阻止公共访问”。它不代表文件已经公开：Bucket 读写权限是私有，测试上传的对象也继承私有权限。如果这个 Bucket 不需要对外公开任何文件，建议在“权限控制 → 阻止公共访问”里开启。
 
-### ARC 镜像结论
+### 3. RAM：一个角色 + 一个用户
 
-ARC 不是 E-HPC Instant 的必选公共依赖。只有在你们已有 ARC 镜像 ID、镜像构建说明或内部制品仓库时，才把它作为节点镜像；否则使用官方基础镜像 + 下文 Dockerfile 构建自定义镜像。切换 ARC 前必须确认：操作系统版本、内核、GPU 驱动/CUDA（如有）、Docker/Containerd、Python 版本、Slurm 客户端、时钟同步和许可证/仓库访问。
+需要两个身份，各管一件事：
 
-### E-HPC Instant 镜像设计
+| 身份 | 谁用 | 权限 |
+|---|---|---|
+| RAM **角色** `ehpc-oss-benchmark` | 作业容器，通过 STS 临时凭证使用 | 只能对 `official-oss/ehpc-benchmark/*` 执行 Put/Get/Delete |
+| RAM **用户** `ehpc-submitter` | 你的本地电脑，AccessKey 写在 `.env` | 提交/查询 INSTANT 作业，以及扮演上面这个角色 |
 
-建议分成两层：节点镜像负责操作系统、Slurm 客户端、Docker/Containerd、驱动和监控代理；GHCR 容器镜像负责 EPC Insta、Python 依赖和应用启动命令。这样更新应用时只重新构建 GHCR 镜像，不必频繁重做 E-HPC 节点镜像。节点需要能访问 `ghcr.io`，并使用公开镜像、Docker credential helper 或节点预置的只读 PAT 拉取镜像。
+每次提交时，脚本会用 RAM 用户申请一组 1 小时有效的临时凭证，并额外限制它只能写本次 run 的目录，然后交给容器使用。本地的长期 AccessKey 不会离开你的电脑。
 
-## 4. 本地测试
+主账号 AccessKey 不能用，因为主账号不能调用 AssumeRole。
 
-### 4.1 直接运行
+在 [RAM 控制台](https://ram.console.aliyun.com/) 操作。账号 ID 在控制台右上角头像 → 账号中心里查看：
 
-需要 Python 3.10+，在本目录执行：
+**3.1 创建容器用的角色**
 
-```powershell
-python .\scripts\epc_insta_smoke.py --out .\work\local-result.json
-```
+如果已经有一个信任“当前云账号”、并带 OSS 权限的普通角色（例如 `AliyunOSSFullAccess`），可以跳过 3.1，直接把它的 ARN 填进 `oss_role_arn`。脚本申请临时凭证时附带的会话策略，会把权限缩小到 `<bucket>/<oss_prefix>/<run-id>/*` 的 Put/Get/Delete，最终权限取两者的交集。服务关联角色（`AliyunServiceRoleFor...`）只能由云服务自己扮演，不能用在这里。
 
-脚本默认验证 CPU、内存、临时目录读写、共享目录（若存在）和可选 EPC Insta 命令。它不会假设你已经安装了 EPC Insta。
+1. 权限管理 → 权限策略 → 创建权限策略 → 脚本编辑。
+   - 粘贴 [config/oss-policy.example.json](config/oss-policy.example.json)，把 `<your-bucket>` 换成 `official-oss`。
+   - 策略名填 `ehpc-oss-benchmark`。
+2. 身份管理 → 角色 → 创建角色。
+   - 信任主体类型选“云账号”，信任主体名称选“当前云账号”。
+   - 角色名填 `ehpc-oss-benchmark`。
+   - 创建后得到的信任策略与 [config/oss-role-trust-policy.example.json](config/oss-role-trust-policy.example.json) 相同。
+3. 角色详情 → 权限管理 → 新增授权，选择自定义策略 `ehpc-oss-benchmark`。
+4. 复制角色详情页的 **ARN**（形如 `acs:ram::<账号ID>:role/ehpc-oss-benchmark`），填到配置的 `oss_role_arn`。
 
-```powershell
-$env:EPC_INSTA_CMD = 'python -c "print(''epc-insta-ok'')"'
-python .\scripts\epc_insta_smoke.py --out .\work\epc-result.json
-```
+角色的“最大会话时间”默认 3600 秒，够用。只有在把 `--wait-timeout` 设到 2700 秒以上时，才需要调大它。
 
-真实程序建议通过环境变量传入，例如：
+**3.2 创建本地提交用的 RAM 用户**
 
-```powershell
-$env:EPC_INSTA_CMD = "python -m epc_insta --version"
-python .\scripts\epc_insta_smoke.py --out .\work\epc-version.json
-```
+这里必须建**用户**（身份管理 → 用户），不能建**角色**（身份管理 → 角色）。原因是：
 
-### 4.2 容器运行
+- 只有用户才有 AccessKey，能写进 `.env` 给本地脚本用。
+- 角色没有 AccessKey，只能被别的身份“扮演”。
 
-```powershell
-docker build -f .\image\Dockerfile -t epc-insta-test:py311 .
-docker run --rm -v "${PWD}\work:/work" epc-insta-test:py311
-```
+1. 身份管理 → **用户** → 创建用户。
+   - 登录名填 `ehpc-submitter`，访问方式勾选“使用永久 AccessKey 访问”（OpenAPI 调用）。
+   - 创建后**立即保存** AccessKey ID 和 Secret（Secret 只显示这一次），填进 `.env`。
+2. 用户列表中该用户 → 添加权限，二选一：
+   - **省事**：选系统策略 `AliyunEHPCFullAccess` 和 `AliyunSTSAssumeRoleAccess`。
+   - **最小权限**：粘贴 [config/submit-policy.example.json](config/submit-policy.example.json)，把 `<account-id>` 和 `<oss-benchmark-role>` 换成实际值，创建为自定义策略后授权。它只允许 `ehpc:CreateJob`、`ehpc:GetJob`，以及扮演 3.1 的那一个角色。
 
-Dockerfile 当前安装 Python 3.11、FIO，并读取 `image/requirements.txt` 安装 Python 依赖。如果 EPC Insta 在私有仓库，先登录镜像仓库，再通过 `requirements.txt` 或派生 Dockerfile 安装/复制程序。不要把仓库密码写进 Dockerfile。
+这个用户没有 OSS 权限，所以查看结果请用主账号登录 OSS 控制台。
 
-### 4.3 文件型 SSD 测试
+### 4. E-HPC INSTANT 与香港 VPC
 
-脚本加入了标准 FIO 顺序/随机读写组合，参数与 `config/fio-ssd-file-test.fio` 对齐，使用挂载目录中的临时文件，不直接操作 `/dev/vd*` 等裸设备。默认不执行，避免误测或产生较大 I/O；在 E-HPC 节点上明确指定数据盘挂载点后运行：
+为什么必须有 VPC：
 
-```bash
-python3 /shared/epc-insta-test/scripts/epc_insta_smoke.py \
-  --ssd-test --ssd-dir /mnt --ssd-size 1G --ssd-runtime 30 \
-  --out /shared/results/ssd-${HOSTNAME}.json
-```
+- INSTANT 每次运行作业都会临时开一台机器，这台机器要在 VPC 里挂网卡才能联网。官方把 VPC、交换机、安全组列为前提条件。
+- 这台机器要通过**内网**拉取 ACR 镜像（`-vpc` 地址），并用内网访问 OSS（`-internal` 地址）。这两个内网地址只有香港的 VPC 能访问。
+- 不用 VPC 就只能走公网：OSS 公网下载要收流量费，而且测到的是公网速度，失去了测试意义。
 
-如果数据盘挂载在 `/data`，将 `--ssd-dir` 改为 `/data`。结果会记录顺序读写、随机读写的 IOPS、带宽和平均完成延迟。该测试会创建并删除测试文件，仍然应使用专用测试目录，不要指向系统根目录或生产数据目录。
+VPC、交换机、安全组本身都是免费的。
 
-如果要使用完整 FIO job 文件进行复测：
+INSTANT 没有集群要创建或维护。它是按作业计费的无服务器计算：每次 `CreateJob` 时临时分配机器，跑完即释放。镜像、CPU、内存、磁盘、网络都写在每次的提交请求里，由提交脚本根据配置文件自动生成。
 
-```bash
-mkdir -p /mnt/epc-insta-fio
-sed 's#directory=/mnt/epc-insta-fio#directory=/data/epc-insta-fio#' \
-  /shared/epc-insta-test/config/fio-ssd-file-test.fio > /tmp/epc-insta.fio
-mkdir -p /data/epc-insta-fio
-fio /tmp/epc-insta.fio --output-format=json \
-  > /shared/results/fio-${HOSTNAME}.json
-```
+所以“HPC 的配置”只有下面几步：
 
-基准测试中的 `1G` 文件大小和 `30` 秒运行时间适合 smoke test；性能验收时应按业务数据规模、队列深度和重复次数重新设定，并记录 ESSD 磁盘类型、容量、PL 等级、实例规格和可用区。
+1. **开通 INSTANT**（需要已完成实名认证）：在 E-HPC 控制台进入 E-HPC Instant 开通页，页面上点“创建服务关联角色”，同意协议并开通，等待 1～5 分钟。服务关联角色用于授权 INSTANT 在你的账号里创建机器、挂网卡，属于平台自身的权限，与上面的 RAM 角色无关。
+2. **创建香港 VPC 和交换机**（官方把 VPC、交换机、安全组列为前提条件）：
+   - [VPC 控制台](https://vpc.console.aliyun.com/) → 地域选“中国香港” → 创建专有网络，例如网段 `172.16.0.0/12`。
+   - 同时创建交换机：选一个可用区，例如 `172.16.0.0/24`。
+   - 如果香港已经有 VPC（例如默认 VPC），可以直接复用它的交换机。
+   - 复制交换机 ID（`vsw-...`），填到配置的 `vswitch_id`。
+3. **创建安全组**：[ECS 控制台](https://ecs.console.aliyun.com/) → 网络与安全 → 安全组 → 地域选中国香港 → 创建安全组。
+   - 专有网络选上一步的 VPC，规则保持默认：入方向不用开端口，出方向默认放行。
+   - 复制 `sg-...`，填到配置的 `security_group_id`。
 
-## 5. 本地触发到 OSS 的自动闭环
+作业默认不分配公网 IP，通过内网访问：
 
-项目提供 `scripts/trigger_epc_test.py`，用于从本地电脑发起一次单节点远程测试。它通过 SSH 登录 E-HPC 登录节点，自动上传/更新作业执行脚本并提交 Slurm 作业；计算节点收到作业后会自动拉取 GHCR 镜像、启动容器、执行测试，最后使用节点上的 `ossutil` 将运行目录上传到 OSS。
+- 拉镜像：ACR“专有网络”地址 `crpi-…-vpc.cn-hongkong.personal.cr.aliyuncs.com`，只有**同地域 VPC** 能访问。
+- 访问 OSS：`https://oss-cn-hongkong-internal.aliyuncs.com`。
 
-```powershell
-python .\scripts\trigger_epc_test.py `
-  --ssh-target user@login-node `
-  --ssh-key $env:EPC_SSH_KEY `
-  --image ghcr.io/<github-owner>/<github-repo>/epc-insta-test:latest `
-  --oss-uri oss://private-bucket/results `
-  --epc-command "python -m epc_insta --version" `
-  --wait
-```
+所以 ACR、OSS、VPC、INSTANT 都必须在香港，内网流量免费。如果提交时报交换机所在可用区没有库存，就在另一个可用区再建一个交换机，把 `vswitch_id` 换成新的。
 
-一次运行的结果会放在 `oss://private-bucket/results/<run-id>/`，通常包括：
+### 5. 本地环境
 
-* `manifest.json`：镜像、Slurm 作业、测试退出码、上传状态和最终判定。
-* `smoke-result.json`：容器内 Smoke Test 的详细结果。
-* `docker-pull.log`、`docker.log`：拉镜像和容器标准输出/错误。
-* `oss-upload.log`：OSS 上传日志。
-
-### 自动闭环的前置条件
-
-1. GHCR 中已经存在目标镜像，且镜像的启动命令能够执行 `epc_insta_smoke.py`。真实 EPC Insta 程序及其依赖需要在 `image/Dockerfile`/`image/requirements.txt` 中加入，或由镜像入口自行提供。
-2. E-HPC 登录节点可以执行 `sbatch`，并且 `--remote-dir`（默认 `/shared/epc-insta-test`）可写。触发器默认会把 `run_epc_job.sh` 同步到该目录；使用 `--wait` 时还需要 Slurm accounting 的 `sacct` 可用。
-3. 计算节点已安装 Docker，并允许 Slurm 用户运行 Docker；节点可以访问 `ghcr.io`。私有 GHCR 使用节点预置的 Docker credential helper 或受保护的 `REGISTRY_*` 环境变量，公开 GHCR 镜像无需登录。
-4. 计算节点已安装并配置 `ossutil`，或通过组织批准的方式获得 OSS 临时凭证。建议使用 RAM Role，不要把 AccessKey 写入触发命令、脚本或镜像。
-5. `/shared` 已挂载到所有计算节点。默认开启 `--require-shared`，共享目录异常会使测试失败。
-
-远程触发默认要求 `--epc-command`，避免真实 EPC Insta 测试被跳过却显示成功；仅验证基础运行环境时显式改用 `--baseline-only`。如果本机使用 `uv` 管理 Python，也可以把命令前缀替换为 `uv run --no-project python`。
-
-触发器会打印 `run_id`、`job_id` 和 OSS 结果前缀。加上 `--wait` 会轮询 Slurm 并等待作业结束；不加则提交成功后立即返回。作业退出码为 `2` 表示镜像拉取或测试失败，`3` 表示 OSS 上传失败。
-
-## 6. Slurm 多节点测试
-
-把本目录上传到登录节点（例如 `/shared/epc-insta-test`），然后：
+需要 Python 3.9 及以上版本（本地 3.9 和 CI 3.11 都已验证）。在仓库根目录执行：
 
 ```bash
-srun -N 2 -n 2 --ntasks-per-node=1 \
-  python /shared/epc-insta-test/scripts/epc_insta_smoke.py --require-shared \
-  --out /shared/results/${SLURM_JOB_ID}-${SLURM_PROCID}.json
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp config/instant.example.json config/instant.local.json   # 已被 .gitignore 排除
+cp .env.example .env && chmod 600 .env                     # 已被 .gitignore 排除
 ```
 
-更稳定的做法是提交 `sbatch` 作业：
+**`config/instant.local.json`（非秘密参数）**：把所有 `<...>` 占位符都换掉。
+
+| 字段 | 说明 |
+|---|---|
+| `region` | `cn-hongkong`，需要与 ACR、OSS、vSwitch 同地域 |
+| `image` | ACR“专有网络”地址 + `/<命名空间>/<仓库名>:latest`，当前为 `crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:latest` |
+| `private_registry` | 私有仓库设为 `true`，需要 `.env` 里的 `ACR_PULL_*`；公开仓库设为 `false` |
+| `vswitch_id` / `security_group_id` | 第 4 步创建的交换机和安全组 |
+| `enable_external_ip` | 是否给作业分配公网 IP，默认 `false` |
+| `oss_role_arn` | 第 3.1 步的角色 ARN |
+| `resources.cores` / `memory_gib` / `system_disk_gib` | 作业规格，默认 2 核 / 4 GiB / 40 GiB。系统盘要能装下 FIO 文件和 2 倍 OSS 测试对象 |
+| `resources.instance_types`（可选） | 最多 5 个实例规格，例如 `["ecs.g7.large"]`，用于固定 CPU 代际 |
+| `benchmark.oss_*` | Bucket（`official-oss`）、地域、内网 Endpoint、归档前缀、测速对象大小（默认 1024 MiB） |
+| `benchmark.disk_dir` | 容器内的 FIO 测试目录，默认 `/tmp/ehpc-benchmark`。不要指向 `/dev` 或 `/` |
+| `benchmark.fio_size_mib` / `fio_runtime_seconds` | FIO 文件大小和每组运行时长。官方为每组 1000 秒，这里默认 30 秒 |
+
+**`.env`（秘密）**：提交脚本每次运行都会自动读取，不需要手动 `export`。终端里已经 export 的同名变量优先。
 
 ```bash
-#!/bin/bash
-#SBATCH -N 2
-#SBATCH --ntasks-per-node=1
-#SBATCH -J epc-insta-smoke
-#SBATCH -o /shared/results/%x-%j.out
-set -euo pipefail
-python /shared/epc-insta-test/scripts/epc_insta_smoke.py --require-shared \
-  --out /shared/results/${SLURM_JOB_ID}-${SLURM_PROCID}.json
+ALIBABA_CLOUD_ACCESS_KEY_ID=<第 3.2 步 RAM 用户的 AccessKey ID>
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=<对应 Secret>
+ACR_PULL_USERNAME=NeoNexus
+ACR_PULL_PASSWORD=<ACR 访问凭证密码>
+ALIBABA_CLOUD_ECS_METADATA_DISABLED=true
 ```
 
-多节点通过条件：每个 task 的 JSON 中 `overall_pass=true`，节点名不同且所有节点均能读写 `/shared`。如果 EPC Insta 自带启动器，替换 `srun` 的命令部分，并保留退出码和结果归档。
+`.env` 和 `config/instant.local.json` 都已被 `.gitignore` 排除，也被 `.dockerignore` 排除，不会进入 Git 或镜像。
 
-## 7. GitHub Actions 自动推送 GHCR
+## 二、运行
 
-工作流文件是 `.github/workflows/build-and-push-ghcr.yml`。它只在推送到 `main` 时运行；每次成功会推送 `latest` 和 Git SHA 两个标签。
+```bash
+# 1) 预览：校验配置，按官方 SDK 模型检查请求；不需要凭证，不调用任何 API
+python scripts/submit_instant.py --config config/instant.local.json --dry-run
 
-工作流使用 GitHub 内置的 `GITHUB_TOKEN`，不需要额外的镜像推送 Secret。仓库必须允许 Actions 写入 packages，并在第一次发布后到 `Packages` 设置镜像为 Public，或者给 E-HPC 节点配置只读 `read:packages` PAT。配置细节见 `config/github-ghcr.example.md`。
+# 2) 提交并等待结束（默认最多等 1800 秒）
+python scripts/submit_instant.py --config config/instant.local.json --wait
 
-镜像地址格式为：
+# 3) 只查询已有作业，不会重复提交
+python scripts/submit_instant.py --config config/instant.local.json --job-id job-xxxxxxxx --wait-timeout 1800
+```
+
+提交成功后会打印 `run_id`、`job_id` 和 OSS 归档前缀，并保存到本地 `work/<run-id>/submission.json`。
+
+本地退出码：
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 作业成功；不带 `--wait` 时表示已提交 |
+| 1 | 配置错误或 API 调用失败，会打印服务端错误码 |
+| 2 | 作业以失败状态结束 |
+| 4 | 本地等待超时，**云端作业不会被取消** |
+
+注意事项：
+
+- 如果 `CreateJob` 报错，作业仍可能已经创建。请先到控制台确认，再决定是否重新提交。
+- STS 有效期取 `max(3600, wait-timeout + 900)` 秒，需要覆盖“排队 + 拉镜像 + 测试 + 归档”的全过程。
+- 调大 `--wait-timeout` 或 `fio_runtime_seconds` 时，要同步调大角色的最大会话时间。
+
+## 三、结果
 
 ```text
-ghcr.io/<github-owner>/<github-repo>/epc-insta-test:latest
-ghcr.io/<github-owner>/<github-repo>/epc-insta-test:sha-<short-sha>
+oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/
+  run.log            可读的逐行结果（见下）
+  result.json        全部原始数据：lscpu JSON、findmnt/lsblk、每组 FIO 指标、OSS 测速
+  fio-prefill.json   FIO 预填充
+  fio-<profile>.json 每组 FIO 的完整 JSON 输出
+  oss-upload.json    每个文件的上传状态
+  manifest.json      最后上传；overall_pass=true 表示测试全部通过且归档完整
 ```
 
-推送代码后，可在 E-HPC 登录节点验证镜像：
+`run.log` 格式如下（数值为占位）：
+
+```text
+... cpu model: <型号> (<厂商>, x86_64)
+... cpu topology: cpus=2 sockets=1 cores/socket=1 threads/core=2 max_mhz=... l3=... hypervisor=KVM
+... disk target=/tmp/ehpc-benchmark fstype=overlay source=overlay runtime=30s/profile physical_local_ssd_verified=false
+... fio seqwrite          write     bs=128k iodepth=128 numjobs=1 bw=...MiB/s iops=... lat_mean=...us lat_p99=...us
+... fio randread          randread  bs=4k   iodepth=32  numjobs=4 bw=...MiB/s iops=... lat_mean=...us lat_p99=...us
+... oss upload: ...MiB/s (...s)
+... oss download: ...MiB/s (...s)
+... oss sha256_match=True cleanup=passed error=None
+```
+
+以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。
+
+容器退出码：`0` 全部通过，`2` 有测试失败，`3` 归档失败，`64` 启动配置或凭证错误。如果镜像拉取失败、容器被强制终止，或 OSS 完全不可达，OSS 上可能没有日志，这时请查看 INSTANT 控制台。
+
+## 四、限制
+
+- **INSTANT 不暴露物理本地 NVMe 盘。** `CreateJob` 的 `Resource.Disks` 目前只支持 `System`，挂载方式只支持 NAS/OSS。
+  - FIO 实际测的是容器 `/tmp` 所在的文件系统，通常是系统云盘上的 overlay。结果会记录 `findmnt`/`lsblk`，并固定标记 `physical_local_ssd_verified=false`。
+  - FIO 的块大小、队列深度和并发数与官方本地盘方法一致。但官方是裸盘、每组 1000 秒，这里是文件型、默认每组 30 秒，结果不能直接等同官方裸盘数据。
+  - 如果必须测物理本地 SSD，需要换用带本地盘的 ECS 实例（如 i 系列）直接跑 FIO，或者先向阿里云确认 INSTANT 是否支持。
+- OSS 数值是单连接端到端吞吐，包含 SDK 和本地文件读写开销。
+- STS 临时凭证通过容器环境变量传入：
+  - 有权限查看作业配置的人能看到这些值。
+  - 凭证已被会话策略限制在本次 run 的前缀内，并且会自动过期。
+  - 本地 API 的 AccessKey 不会传进容器。
+
+## 开发
 
 ```bash
-docker pull ghcr.io/<github-owner>/<github-repo>/epc-insta-test:latest
-docker run --rm --user 10001 \
-  -v /shared/results:/work \
-  ghcr.io/<github-owner>/<github-repo>/epc-insta-test:latest
+pip install -r requirements.txt -r image/requirements.txt
+python -m unittest discover -s tests -v
 ```
 
-生产测试建议把触发命令中的 `:latest` 换成不可变的 `:sha-<short-sha>`，这样 OSS 结果可准确对应代码版本；日常联调使用 `latest` 即可。GHCR 负责容器镜像分发，E-HPC 节点镜像仍负责操作系统、驱动和 Slurm 环境。
+离线测试覆盖以下内容：
 
-## 8. 结果判定和扩容顺序
+- SDK 请求结构、参数分块、实例规格
+- STS 会话策略范围、凭证脱敏
+- 终态等待、超时不取消作业
+- OSS 数据校验和清理、归档失败的退出码
+- `run.log` 可读结果、`lscpu` 解析
 
-* **P0 基线**：单节点、无 GPU、官方基础镜像，脚本所有基础检查通过。
-* **P1 应用**：注入实际 EPC Insta 命令，命令退出码为 0，版本和依赖输出可追溯。
-* **P2 共享存储**：2 个节点并行运行，所有节点能看到同一共享标记文件，结果写入 OSS/NAS。
-* **P3 性能**：固定输入、节点数、镜像 digest 和实例规格，重复 3 次，记录 wall time、CPU/GPU 利用率、吞吐、失败重试。
+CI 还会在构建出的镜像里实际运行 `lscpu` 和短时 FIO。真实的 INSTANT/ACR/OSS 连通性需要填好账号配置后首次联调才能验证。
 
-每次实验保存：Git commit、Docker image digest、E-HPC 集群 ID、地域/可用区、实例规格、镜像 ID、Slurm job ID、输入数据版本和结果 JSON。
+## 官方依据
 
-## 9. 常见故障定位
-
-* 作业 `PENDING`：检查配额、节点健康、分区和实例库存。
-* 节点能 SSH 但 `srun` 失败：检查 Slurm 时间同步、主机名解析、安全组 6817-6819 和 controller/agent 状态。
-* 容器无法启动：检查 Docker/Containerd 服务、用户组权限、镜像架构（x86_64/ARM64）和磁盘空间。
-* GPU 程序报驱动错误：核对 GPU 实例、宿主机驱动、容器 runtime 和 CUDA 版本矩阵。
-* `/shared` 不一致：确认 NAS 挂载点、挂载选项、UID/GID 和每个节点的挂载路径完全一致。
-* 拉包失败：不要把凭据放入镜像；使用 RAM 角色、私有镜像仓库登录令牌或预热镜像。
-
-## 10. 上线前检查清单
-
-- [ ] 控制台中确认 E-HPC Instant、EPC Insta、ARC 的准确产品名和地域可用性。
-- [ ] 确认实例、GPU、NAS、OSS、vCPU 和公网带宽配额。
-- [ ] 完成 RAM 最小权限、VPC/安全组、密钥对和审计日志配置。
-- [ ] 官方基础镜像单节点通过。
-- [ ] ARC 镜像（若确有）单节点通过并记录镜像 ID/版本。
-- [ ] EPC Insta 版本、依赖、许可证和数据集版本固定。
-- [ ] 2 节点 Slurm smoke test 通过，结果已写入 OSS/NAS。
-- [ ] SSD FIO 测试使用专用挂载目录，结果已保存并与实例规格关联。
-- [ ] GitHub Actions 已推送 GHCR 镜像，未在日志中暴露凭据。
-- [ ] 完成成本预算、自动伸缩/关机策略和失败告警。
-
-
+- [INSTANT CreateJob](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/developer-reference/api-ehpcinstant-2023-07-01-createjob)
+- [INSTANT GetJob](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/developer-reference/api-ehpcinstant-2023-07-01-getjob)
+- [INSTANT 服务关联角色](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/security-and-compliance/service-linked-role-of-e-hpc-instant-service)
+- [块存储/本地盘 FIO 测试方法](https://www.alibabacloud.com/help/en/ecs/user-guide/test-the-performance-of-block-storage-devices)
+- [STS AssumeRole](https://help.aliyun.com/zh/ram/developer-reference/api-sts-2015-04-01-assumerole)
+- [ACR 推送/拉取镜像](https://help.aliyun.com/zh/acr/getting-started/use-a-container-registry-enterprise-edition-instance-to-push-and-pull-images)

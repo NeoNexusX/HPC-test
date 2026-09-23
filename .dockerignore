@@ -1,7 +1,11 @@
 .git
 .github
-work
+.venv
 __pycache__
+config
+tests
+work
+secrets
 *.json
 *.log
-
+.env*

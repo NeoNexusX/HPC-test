@@ -1,0 +1,24 @@
+{
+  "region": "cn-hongkong",
+  "image": "crpi-<instance-id>-vpc.cn-hongkong.personal.cr.aliyuncs.com/<namespace>/<repository>:latest",
+  "private_registry": true,
+  "vswitch_id": "vsw-<replace>",
+  "security_group_id": "sg-<replace>",
+  "enable_external_ip": false,
+  "oss_role_arn": "acs:ram::<account-id>:role/<oss-benchmark-role>",
+  "resources": {
+    "cores": 2,
+    "memory_gib": 4,
+    "system_disk_gib": 40
+  },
+  "benchmark": {
+    "oss_bucket": "<your-bucket>",
+    "oss_region": "cn-hongkong",
+    "oss_endpoint": "https://oss-cn-hongkong-internal.aliyuncs.com",
+    "oss_prefix": "ehpc-benchmark",
+    "oss_size_mib": 1024,
+    "disk_dir": "/tmp/ehpc-benchmark",
+    "fio_size_mib": 1024,
+    "fio_runtime_seconds": 30
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "Version": "1",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["ehpc:CreateJob", "ehpc:GetJob"], "Resource": "*"},
+    {"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "acs:ram::<account-id>:role/<oss-benchmark-role>"}
+  ]
+}

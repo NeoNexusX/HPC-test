@@ -1,115 +1,103 @@
-name: Build and push image to Alibaba Cloud ACR
+name: Test, build and push to Alibaba Cloud ACR
 
 on:
   push:
-    branches: [main]
-    tags: ['v*.*.*']
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  IMAGE_NAME: epc-insta-test
+  # Image location is not secret; only the ACR login is stored in GitHub secrets.
+  # Public endpoint: GitHub-hosted runners push over the internet. INSTANT pulls via the -vpc endpoint.
+  ACR_REGISTRY: crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com
+  ACR_IMAGE: crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo
 
 jobs:
-  build-and-push:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Alibaba Cloud ACR
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          registry: ${{ secrets.ACR_REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r image/requirements.txt
+      - name: Test API payload, benchmarks and archive failures
+        run: python -m unittest discover -s tests -v
 
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and load image for smoke test
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./image/Dockerfile
+          file: image/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ehpc-instant-benchmark:ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify CPU inventory and FIO inside the image
+        run: |
+          docker run --rm ehpc-instant-benchmark:ci python /app/run_instant_job.py --help
+          docker run --rm -i --entrypoint python ehpc-instant-benchmark:ci - <<'EOF'
+          import tempfile
+          from pathlib import Path
+          from benchmark import cpu_inventory, fio_benchmark, summarize
+          cpu = cpu_inventory()
+          print("\n".join(summarize("cpu", cpu)))
+          assert cpu["pass"] and cpu["summary"].get("model"), cpu
+          settings = {"disk_dir": "/tmp/ci-fio", "fio_size_mib": 16, "fio_runtime_seconds": 1}
+          with tempfile.TemporaryDirectory() as out:
+              disk = fio_benchmark(settings, Path(out))
+          print("\n".join(summarize("disk", disk)))
+          assert disk["pass"], disk
+          EOF
+      - name: Check ACR login secrets
+        if: github.event_name != 'pull_request'
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          : "${ACR_USERNAME:?Add repository secret ACR_USERNAME (docker login --username)}"
+          : "${ACR_PASSWORD:?Add repository secret ACR_PASSWORD (ACR access credential password)}"
+      - name: Log in to ACR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Image tags
+        if: github.event_name != 'pull_request'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Push tested image to ACR
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: image/Dockerfile
+          platforms: linux/amd64
           push: true
+          build-args: GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  run-tests-on-ehpc:
-    name: Run SSD and OSS tests on E-HPC
-    needs: build-and-push
-    # Install a GitHub self-hosted runner on the E-HPC test node and add these labels.
-    runs-on: [self-hosted, linux, e-hpc]
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Pull image and run SSD/OSS tests
-        env:
-          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
-          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
-          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-          OSS_SESSION_TOKEN: ${{ secrets.OSS_SESSION_TOKEN }}
-          OSS_BUCKET: ${{ vars.OSS_BUCKET }}
-          OSS_PREFIX: ${{ vars.OSS_PREFIX }}
-          OSS_REGION: ${{ vars.OSS_REGION }}
-          EPC_SSD_DIR: ${{ vars.EPC_SSD_DIR }}
-          SSD_TEST_SIZE: ${{ vars.SSD_TEST_SIZE }}
-          SSD_TEST_RUNTIME: ${{ vars.SSD_TEST_RUNTIME }}
-        run: |
-          set -euo pipefail
-          : "${ACR_REGISTRY:?missing ACR_REGISTRY}"
-          : "${ACR_NAMESPACE:?missing ACR_NAMESPACE}"
-          : "${OSS_BUCKET:?missing OSS_BUCKET repository variable}"
-          : "${OSS_REGION:?missing OSS_REGION repository variable}"
-          : "${EPC_SSD_DIR:?missing EPC_SSD_DIR runner variable}"
-          test -d "${EPC_SSD_DIR}"
-          mkdir -p "${RUNNER_TEMP}/epc-results"
-
-          image="${ACR_REGISTRY}/${ACR_NAMESPACE}/epc-insta-test:${GITHUB_SHA:0:7}"
-          printf '%s' "${ACR_PASSWORD}" | docker login "${ACR_REGISTRY}" \
-            --username "${ACR_USERNAME}" --password-stdin
-          docker pull "${image}"
-
-          object_uri="oss://${OSS_BUCKET}/${OSS_PREFIX:-epc-insta/github}/${GITHUB_REPOSITORY//\//-}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.bin"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --mount "type=bind,src=${EPC_SSD_DIR},dst=/data" \
-            --mount "type=bind,src=${RUNNER_TEMP}/epc-results,dst=/work" \
-            --env OSS_ACCESS_KEY_ID \
-            --env OSS_ACCESS_KEY_SECRET \
-            --env OSS_SESSION_TOKEN \
-            --env OSS_REGION \
-            "${image}" \
-            --ssd-test --ssd-dir /data \
-            --ssd-size "${SSD_TEST_SIZE:-1G}" \
-            --ssd-runtime "${SSD_TEST_RUNTIME:-30}" \
-            --oss-test --oss-uri "${object_uri}" --oss-size 64M \
-            --out /work/epc-insta-result.json
-
-      - name: Upload test result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: epc-insta-test-${{ github.run_id }}
-          path: ${{ runner.temp }}/epc-results/epc-insta-result.json
-          if-no-files-found: warn
