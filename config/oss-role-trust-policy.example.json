@@ -3,6 +3,6 @@
   "Statement": [{
     "Effect": "Allow",
     "Action": "sts:AssumeRole",
-    "Principal": {"RAM": ["acs:ram::<account-id>:root"]}
+    "Principal": {"RAM": ["acs:ram::1941738188153520:role/kawaru-oss-sts-access"]}
   }]
 }
