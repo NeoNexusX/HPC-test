@@ -96,6 +96,10 @@ jobs:
           file: image/Dockerfile
           platforms: linux/amd64
           push: true
+          # ACR personal edition rejects OCI attestation manifests
+          # (application/vnd.oci.empty.v1+json), so push a plain image manifest.
+          provenance: false
+          sbom: false
           build-args: GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
