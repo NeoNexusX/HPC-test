@@ -18,8 +18,8 @@ import traceback
 import uuid
 
 from umap_job import (check_disk_space, cpu_inventory, cpu_lines, diff_snapshot, download_objects, error_detail,
-                      error_name, list_source_objects, run_umap, snapshot_dir, split_download_objects,
-                      upload_files, validate_settings)
+                      error_name, import_massflow, list_source_objects, run_umap, snapshot_dir,
+                      split_download_objects, upload_files, validate_settings)
 
 
 def make_bucket(settings: dict):
@@ -111,6 +111,7 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
         check_disk_space(work, download_bytes)
         stage("download", lambda: download_objects(bucket, download, source, local_source))
         before = snapshot_dir(local_source)
+        stage("import", import_massflow)
         umap = stage("umap", lambda: run_umap(settings, local_source, output / "umap_image.jpg"))
         result["umap"] = umap
         log(f"umap pixels={umap['pixels']} features={umap['features']} matrix={umap['matrix_mib']:.1f}MiB "

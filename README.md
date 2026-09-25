@@ -180,7 +180,7 @@ cp .env.example .env && chmod 600 .env                     # 已被 .gitignore �
 | 字段 | 说明 |
 |---|---|
 | `region` | `cn-hongkong`，需要与 ACR、OSS、vSwitch 同地域 |
-| `image` | ACR“专有网络”地址 + `/<命名空间>/<仓库名>:latest`，当前为 `crpi-y6a776c9l4k3agmh-vpc.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:latest` |
+| `image` | ACR“专有网络”地址 + `/<命名空间>/<仓库名>:<标签>`。**推荐用 `:sha-<完整 commit SHA>`**：INSTANT 的执行节点可能复用本地缓存的同名标签，用 `:latest` 时，刚推送的新镜像不一定会被拉取，作业会悄悄跑旧代码。每次 push、CI 变绿后，把标签换成新的 commit SHA |
 | `private_registry` | 私有仓库设为 `true`，需要 `.env` 里的 `ACR_PULL_*`；公开仓库设为 `false` |
 | `vswitch_id` / `security_group_id` | 第 4 步创建的交换机和安全组 |
 | `enable_external_ip` | 是否给作业分配公网 IP，默认 `false` |
@@ -269,10 +269,12 @@ oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/
 ... finish umap 10.1s
 ... umap pixels=20346 features=836 matrix=64.9MiB fit_samples=20346 sample_ratio=1.000000
 ... upload 6 new zarr files -> oss://official-oss/ehpc-benchmark/<run-id>/<attempt-id>/zarr-delta/
-... umap_pass=True peak_rss=974.9MiB stages_seconds={'list': ..., 'download': ..., 'umap': ..., 'upload': ...}
+... umap_pass=True peak_rss=974.9MiB stages_seconds={'list': ..., 'download': ..., 'import': ..., 'umap': ..., 'upload': ...}
 ```
 
-以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。`umap` 阶段包含 numba 首次 JIT 编译，在新机器上每次都会发生，通常几十秒。
+以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。
+
+关于 numba 编译：镜像构建时会用合成数据跑一次 UMAP，把 numba 编译缓存和 matplotlib 字体缓存打进镜像，`import` 阶段因此只剩加载缓存的时间（本地模拟由 11.2 秒降到 2.7 秒）。为了让 CI 构建机上生成的缓存在 INSTANT 主机上也能命中，镜像把 numba 的编译目标固定为 `x86-64-v3`（AVX2），因此要求实例 CPU 支持 AVX2（c9a 等当代规格都支持）。umap-learn 有一部分函数没有标记为可缓存，仍会在每个作业的 `umap` 阶段首次调用时编译，这部分约占测试数据 `umap` 阶段的大半，数据越大占比越小。
 
 容器退出码：`0` 成功，`2` UMAP 流水线失败（列举、下载、计算或结果上传），`3` 日志/manifest 归档失败，`64` 启动配置或凭证错误。这些退出码不会触发 INSTANT 重试；被 OOM 杀掉等其他退出码会按 `RetryCount: 1` 在新机器上重跑一次。如果镜像拉取失败、容器被强制终止，或 OSS 完全不可达，OSS 上可能没有日志，这时请查看 INSTANT 控制台。
 

@@ -117,6 +117,7 @@ class UmapJobTests(unittest.TestCase):
         self.assertEqual(umap_job.lscpu_summary({"lscpu": [{"field": "Model name:", "data": "X"}]}), {"model": "X"})
 
 
+@patch.object(runner, "import_massflow")
 @patch.object(runner, "cpu_inventory", return_value={"pass": True, "summary": {"model": "Test CPU"}})
 class RunnerTests(unittest.TestCase):
     def run_job(self, bucket, **overrides):
@@ -146,7 +147,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("cpu model: Test CPU", files["run.log"])
         result = json.loads(files["result.json"])
         self.assertEqual(result["dataset"]["skipped_ion_image_chunks"], 1)
-        self.assertEqual(set(result["stages_seconds"]), {"list", "download", "umap", "upload"})
+        self.assertEqual(set(result["stages_seconds"]), {"list", "download", "import", "umap", "upload"})
 
     @patch.object(runner, "run_umap", side_effect=fake_umap)
     def test_write_back_stores_analysis_in_source_zarr(self, *_):
@@ -167,7 +168,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((manifest["umap_pass"], manifest["overall_pass"]), (False, False))
         self.assertTrue(any(k.endswith("/manifest.json") for k in bucket.objects))
 
-    def test_oss_errors_keep_only_class_and_code(self, _):
+    def test_oss_errors_keep_only_class_and_code(self, *_):
         class DeniedBucket(Bucket):
             def list_objects_v2(self, **_):
                 raise oss2.exceptions.AccessDenied(403, {}, b"", {"Code": "AccessDenied",
@@ -186,24 +187,6 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("sensitive", files["run.log"])
 
 
-def write_synthetic_zarr(path: Path) -> Path:
-    """A small MassFlow MSI Zarr with the same layout as the test data: ion_image plus spectra."""
-    import numpy as np
-    from massflow.msi_zarr.writer import MSIZarrWriter
-
-    rng = np.random.default_rng(0)
-    width, height, mz = 12, 10, np.linspace(100, 500, 40)
-    writer = MSIZarrWriter(str(path), row_axis="ion", encoding="continuous", metadata=None,
-                           width=width, height=height, include_spectra=True)
-    for y in range(1, height + 1):
-        for x in range(1, width + 1):
-            # Two spatial regions with different spectra give UMAP some structure.
-            writer.add_spectrum(rng.random(mz.size, dtype=np.float32) + (x > width // 2), (x, y, 1), mz)
-    writer.finalize()
-    writer.close()
-    return path
-
-
 @unittest.skipUnless(HAVE_MASSFLOW or os.environ.get("REQUIRE_MASSFLOW"), "MassFlow is installed in the image")
 class MassFlowIntegrationTests(unittest.TestCase):
     def test_real_umap_through_the_job_runner(self):
@@ -213,7 +196,7 @@ class MassFlowIntegrationTests(unittest.TestCase):
             base = Path(directory)
             os.chdir(base)  # MassFlow creates logs/ in the working directory
             try:
-                local = Path(os.environ.get("UMAP_TEST_ZARR") or write_synthetic_zarr(base / "synthetic.zarr"))
+                local = Path(os.environ.get("UMAP_TEST_ZARR") or umap_job.write_synthetic_zarr(base / "synthetic.zarr"))
                 bucket = Bucket({f"{SOURCE}/{p.relative_to(local).as_posix()}": p.read_bytes()
                                  for p in local.rglob("*") if p.is_file() and "analysis" not in p.parts})
                 (base / "work").mkdir()

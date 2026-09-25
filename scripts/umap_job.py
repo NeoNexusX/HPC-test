@@ -270,6 +270,12 @@ def select_sample_ratio(dm, settings: dict) -> dict:
             "fit_samples": sample_count, "sample_ratio": ratio}
 
 
+def import_massflow() -> None:
+    """Import MassFlow and umap-learn; loads cached numba code, so it is timed as its own stage."""
+    import massflow.data_manager  # noqa: F401
+    import massflow.segmentation  # noqa: F401
+
+
 def run_umap(settings: dict, local_source: Path, image_path: Path) -> dict:
     """Write analysis/umap into the local Zarr copy and save the RGB image, as the FC handler did."""
     from massflow.data_manager import MSDataManagerZarr
@@ -284,3 +290,29 @@ def run_umap(settings: dict, local_source: Path, image_path: Path) -> dict:
     finally:
         dm.close()
     return info
+
+
+def write_synthetic_zarr(path: Path) -> Path:
+    """A small MassFlow MSI Zarr with the test data's layout: ion_image plus spectra, float32."""
+    import numpy as np
+    from massflow.msi_zarr.writer import MSIZarrWriter
+
+    rng = np.random.default_rng(0)
+    width, height, mz = 12, 10, np.linspace(100, 500, 40)
+    writer = MSIZarrWriter(str(path), row_axis="ion", encoding="continuous", metadata=None,
+                           width=width, height=height, include_spectra=True)
+    for y in range(1, height + 1):
+        for x in range(1, width + 1):
+            # Two spatial regions with different spectra give UMAP some structure.
+            writer.add_spectrum(rng.random(mz.size, dtype=np.float32) + (x > width // 2), (x, y, 1), mz)
+    writer.finalize()
+    writer.close()
+    return path
+
+
+def warm_up() -> None:
+    """Run UMAP once at image build so numba's cache and matplotlib's font cache ship in the image."""
+    with tempfile.TemporaryDirectory() as directory:
+        source = write_synthetic_zarr(Path(directory) / "warmup.zarr")
+        budget = {"full_matrix_mib": 1024, "sample_matrix_mib": 1024, "max_fit_samples": 20000}
+        run_umap(budget, source, Path(directory) / "warmup.jpg")
