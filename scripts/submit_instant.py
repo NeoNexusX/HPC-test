@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit or inspect an E-HPC INSTANT benchmark job over HTTPS. No SSH required."""
+"""Submit or inspect an E-HPC INSTANT MassFlow UMAP job over HTTPS. No SSH required."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,7 @@ TERMINAL = SUCCESS | {"Failed", "Exception", "Expired", "Deleted"}
 # Container.Command items and env values are documented as <= 256 chars; Arg's limit is unstated.
 ARG_CHUNK = 256
 RESOURCE_KEYS = {"cores", "memory_gib", "system_disk_gib"}
+OPTIONAL_RESOURCE_KEYS = {"instance_types", "fallback_any_type"}
 
 
 def load_env_file(path: Path) -> None:
@@ -39,7 +40,7 @@ def load_env_file(path: Path) -> None:
 
 
 def validate_config(config: dict) -> None:
-    required = {"region", "image", "vswitch_id", "security_group_id", "oss_role_arn", "resources", "benchmark"}
+    required = {"region", "image", "vswitch_id", "security_group_id", "oss_role_arn", "resources", "umap"}
     allowed = required | {"enable_external_ip", "private_registry"}
     if required - config.keys() or config.keys() - allowed:
         raise ValueError("config has missing or unknown fields; compare instant.example.json")
@@ -52,8 +53,9 @@ def validate_config(config: dict) -> None:
     if not re.fullmatch(r"acs:ram::\d+:role/[A-Za-z0-9.-]+", config["oss_role_arn"]):
         raise ValueError("oss_role_arn must look like acs:ram::<account-id>:role/<role-name>")
     resources = config["resources"]
-    if RESOURCE_KEYS - resources.keys() or resources.keys() - RESOURCE_KEYS - {"instance_types"}:
-        raise ValueError("resources requires cores, memory_gib, system_disk_gib (instance_types is optional)")
+    if RESOURCE_KEYS - resources.keys() or resources.keys() - RESOURCE_KEYS - OPTIONAL_RESOURCE_KEYS:
+        raise ValueError("resources requires cores, memory_gib, system_disk_gib "
+                         "(instance_types and fallback_any_type are optional)")
     for key in RESOURCE_KEYS:
         value = resources[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
@@ -64,23 +66,51 @@ def validate_config(config: dict) -> None:
     if not isinstance(types, list) or len(types) > 5 or not all(
             isinstance(t, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]+", t) for t in types):
         raise ValueError("resources.instance_types must list at most 5 instance types, e.g. ecs.g7.large")
+    if not isinstance(resources.get("fallback_any_type", False), bool):
+        raise ValueError("resources.fallback_any_type must be boolean")
     for key in ("enable_external_ip", "private_registry"):
         if key in config and not isinstance(config[key], bool):
             raise ValueError(f"{key} must be boolean")
-    from benchmark import validate_settings
-    validate_settings(config["benchmark"])
+    from umap_job import validate_settings
+    validate_settings(config["umap"])
+
+
+def select_dataset(config: dict, dataset: str | None) -> None:
+    """Apply --dataset and accept the forms OSS consoles copy: trailing slash or oss://bucket/key."""
+    settings = config["umap"]
+    value = settings.get("source_zarr_path") if dataset is None else dataset
+    if not isinstance(value, str):
+        return  # validate_config reports it
+    if value.startswith("oss://"):
+        bucket, _, value = value[len("oss://"):].partition("/")
+        if bucket != settings.get("oss_bucket"):
+            raise ValueError(f"dataset bucket {bucket!r} differs from umap.oss_bucket")
+    settings["source_zarr_path"] = value.strip("/")
 
 
 def run_prefix(config: dict, run_id: str) -> str:
-    return f"{config['benchmark']['oss_prefix'].strip('/')}/{run_id}"
+    return f"{config['umap']['oss_prefix'].strip('/')}/{run_id}"
+
+
+def results_prefix(config: dict, run_id: str) -> str:
+    settings = config["umap"]
+    return settings["source_zarr_path"] if settings["write_back"] else f"{run_prefix(config, run_id)}/<attempt>/zarr-delta"
 
 
 def oss_session_policy(config: dict, run_id: str) -> dict:
-    # Intersected with the role's own policy: the container can only touch this run's objects.
-    resource = f"acs:oss:*:*:{config['benchmark']['oss_bucket']}/{run_prefix(config, run_id)}/*"
-    return {"Version": "1", "Statement": [{
-        "Effect": "Allow", "Action": ["oss:PutObject", "oss:GetObject", "oss:DeleteObject"],
-        "Resource": [resource]}]}
+    # Intersected with the role's own policy: the container reads the dataset and writes only this
+    # run's archive, plus the dataset's analysis/ group when write_back is enabled.
+    settings = config["umap"]
+    bucket, source = settings["oss_bucket"], settings["source_zarr_path"]
+    writable = [f"acs:oss:*:*:{bucket}/{run_prefix(config, run_id)}/*"]
+    if settings["write_back"]:
+        writable.append(f"acs:oss:*:*:{bucket}/{source}/analysis/*")
+    return {"Version": "1", "Statement": [
+        {"Effect": "Allow", "Action": ["oss:ListObjects"], "Resource": [f"acs:oss:*:*:{bucket}"],
+         "Condition": {"StringLike": {"oss:Prefix": [f"{source}/*"]}}},
+        {"Effect": "Allow", "Action": ["oss:GetObject"], "Resource": [f"acs:oss:*:*:{bucket}/{source}/*"]},
+        {"Effect": "Allow", "Action": ["oss:PutObject"], "Resource": writable},
+    ]}
 
 
 def credential_env(credentials: dict, minimum_seconds: int) -> list[dict]:
@@ -109,10 +139,10 @@ def credential_env(credentials: dict, minimum_seconds: int) -> list[dict]:
 def build_request(config: dict, run_id: str, credentials: dict | None = None,
                   minimum_seconds: int = 1800, registry_env=None) -> dict:
     validate_config(config)
-    settings = json.dumps(dict(config["benchmark"], run_id=run_id), separators=(",", ":"))
+    settings = json.dumps(dict(config["umap"], run_id=run_id), separators=(",", ":"))
     chunks = [settings[i:i + ARG_CHUNK] for i in range(0, len(settings), ARG_CHUNK)]
     if len(chunks) > 9:  # Arg allows at most 10 items including the flag.
-        raise ValueError("benchmark settings are too long for INSTANT container arguments")
+        raise ValueError("umap settings are too long for INSTANT container arguments")
     container = {
         "Image": config["image"],
         "Command": ["python", "/app/run_instant_job.py"],
@@ -136,10 +166,10 @@ def build_request(config: dict, run_id: str, credentials: dict | None = None,
     if r.get("instance_types"):
         resource["InstanceTypes"] = r["instance_types"]
     return {
-        "JobName": f"benchmark-{run_id}",
-        "JobDescription": "CPU inventory, file FIO, OSS transfer and result archive",
+        "JobName": f"umap-{run_id}",
+        "JobDescription": "MassFlow UMAP on an OSS Zarr dataset with result archive",
         "Tasks": [{
-            "TaskName": "benchmark",
+            "TaskName": "umap",
             "TaskSustainable": False,
             "ExecutorPolicy": {"MaxCount": 1, "ArraySpec": {"IndexStart": 0, "IndexEnd": 0, "IndexStep": 1}},
             "TaskSpec": {
@@ -202,10 +232,24 @@ def make_sts_client(region: str):
 def assume_oss_role(sts_client, config: dict, run_id: str, duration_seconds: int) -> dict:
     from alibabacloud_sts20150401.models import AssumeRoleRequest
     response = sts_client.assume_role(AssumeRoleRequest(
-        role_arn=config["oss_role_arn"], role_session_name=f"ehpc-benchmark-{run_id}"[:64],
+        role_arn=config["oss_role_arn"], role_session_name=f"ehpc-umap-{run_id}"[:64],
         duration_seconds=duration_seconds,
         policy=json.dumps(oss_session_policy(config, run_id), separators=(",", ":"))))
     return response.body.credentials.to_map()
+
+
+def create_job(client, config: dict, run_id: str, credentials: dict, wait_timeout: int) -> str:
+    model = sdk_model(build_request(config, run_id, credentials, wait_timeout + 300))
+    job_id = client.create_job(model).body.job_id
+    if not job_id:
+        raise RuntimeError("CreateJob returned no JobId")
+    return job_id
+
+
+def sold_out(exc: Exception) -> bool:
+    # e.g. RecommendEmpty.InstanceTypeSoldOut: the request was rejected, so no job exists.
+    exc = getattr(exc, "inner_exception", None) or exc
+    return "SoldOut" in str(getattr(exc, "code", None) or "")
 
 
 def wait_for_job(client, job_id: str, timeout: int, interval: int) -> int:
@@ -219,6 +263,11 @@ def wait_for_job(client, job_id: str, timeout: int, interval: int) -> int:
             print(f"job_id={job_id} state={state}", flush=True)
             previous = state
         if state in TERMINAL:
+            if state not in SUCCESS:  # e.g. scheduling failures such as sold-out instance types
+                for task in response.get("JobInfo", {}).get("Tasks") or []:
+                    for executor in task.get("ExecutorStatus") or []:
+                        if executor.get("StatusReason"):
+                            print(f"executor {executor.get('ArrayId')}: {executor['StatusReason']}", file=sys.stderr)
             return 0 if state in SUCCESS else 2
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
     print(f"Local wait timed out. Job {job_id} is NOT cancelled; inspect it in INSTANT console.", file=sys.stderr)
@@ -230,6 +279,8 @@ def main() -> int:
     parser.add_argument("--config", default=str(ROOT / "config" / "instant.local.json"))
     parser.add_argument("--env-file", default=str(ROOT / ".env"),
                         help="local secrets file (AccessKey, ACR pull password); never committed")
+    parser.add_argument("--dataset", help="OSS Zarr prefix to analyse, overriding umap.source_zarr_path; "
+                        "e.g. ehpc-benchmark/test_data/sample.zarr or oss://<bucket>/<prefix>.zarr/")
     parser.add_argument("--dry-run", action="store_true", help="validate and preview without credentials or API calls")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--job-id", help="wait for an existing job; never resubmit")
@@ -244,6 +295,8 @@ def main() -> int:
             raise ValueError("--job-id cannot be combined with --dry-run")
         load_env_file(Path(args.env_file))
         config = json.loads(Path(args.config).read_text())
+        if isinstance(config.get("umap"), dict):
+            select_dataset(config, args.dataset)
         validate_config(config)
         if args.job_id:
             stage = "GetJob"
@@ -261,14 +314,26 @@ def main() -> int:
         credentials = assume_oss_role(make_sts_client(config["region"]), config, run_id,
                                       max(3600, args.wait_timeout + 900))
         stage = "CreateJob"
-        model = sdk_model(build_request(config, run_id, credentials, args.wait_timeout + 300))
         client = make_client(config["region"])
-        # Do not automatically retry CreateJob: the API has no ClientToken field.
-        job_id = client.create_job(model).body.job_id
-        if not job_id:
-            raise RuntimeError("CreateJob returned no JobId")
+        # Do not automatically retry CreateJob: the API has no ClientToken field. The one exception
+        # is an explicit sold-out rejection, which guarantees no job was created.
+        try:
+            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
+        except Exception as exc:
+            resources = config["resources"]
+            if not (resources.get("fallback_any_type") and resources.get("instance_types") and sold_out(exc)):
+                raise
+            print(f"Instance types {resources['instance_types']} sold out; resubmitting without InstanceTypes "
+                  "(any type with the same cores/memory).", file=sys.stderr, flush=True)
+            config = copy.deepcopy(config)
+            del config["resources"]["instance_types"]
+            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
+        bucket = config["umap"]["oss_bucket"]
         summary = {"run_id": run_id, "job_id": job_id, "image": config["image"],
-                   "oss_prefix": f"oss://{config['benchmark']['oss_bucket']}/{run_prefix(config, run_id)}/"}
+                   "instance_types": config["resources"].get("instance_types") or "any",
+                   "dataset": f"oss://{bucket}/{config['umap']['source_zarr_path']}/",
+                   "results": f"oss://{bucket}/{results_prefix(config, run_id)}/",
+                   "oss_prefix": f"oss://{bucket}/{run_prefix(config, run_id)}/"}
         out = ROOT / "work" / run_id
         out.mkdir(parents=True, exist_ok=True)
         (out / "submission.json").write_text(json.dumps(summary, indent=2) + "\n")

@@ -1,8 +1,16 @@
 {
   "Version": "1",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["oss:PutObject", "oss:GetObject", "oss:DeleteObject"],
-    "Resource": ["acs:oss:*:*:<your-bucket>/ehpc-benchmark/*"]
-  }]
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["oss:GetObject", "oss:PutObject"],
+      "Resource": ["acs:oss:*:*:<your-bucket>/ehpc-benchmark/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "oss:ListObjects",
+      "Resource": "acs:oss:*:*:<your-bucket>",
+      "Condition": {"StringLike": {"oss:Prefix": "ehpc-benchmark/*"}}
+    }
+  ]
 }

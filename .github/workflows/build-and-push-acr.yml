@@ -23,10 +23,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - name: Install dependencies
         run: pip install -r requirements.txt -r image/requirements.txt
-      - name: Test API payload, benchmarks and archive failures
+      - name: Test API payload, UMAP pipeline (real MassFlow) and archive failures
         run: python -m unittest discover -s tests -v
 
   image:
@@ -42,26 +42,18 @@ jobs:
           file: image/Dockerfile
           platforms: linux/amd64
           load: true
-          tags: ehpc-instant-benchmark:ci
+          tags: ehpc-instant-umap:ci
           build-args: GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Verify CPU inventory and FIO inside the image
+      - name: Run real MassFlow UMAP inside the image
         run: |
-          docker run --rm ehpc-instant-benchmark:ci python /app/run_instant_job.py --help
-          docker run --rm -i --entrypoint python ehpc-instant-benchmark:ci - <<'EOF'
-          import tempfile
-          from pathlib import Path
-          from benchmark import cpu_inventory, fio_benchmark, summarize
-          cpu = cpu_inventory()
-          print("\n".join(summarize("cpu", cpu)))
-          assert cpu["pass"] and cpu["summary"].get("model"), cpu
-          settings = {"disk_dir": "/tmp/ci-fio", "fio_size_mib": 16, "fio_runtime_seconds": 1}
-          with tempfile.TemporaryDirectory() as out:
-              disk = fio_benchmark(settings, Path(out))
-          print("\n".join(summarize("disk", disk)))
-          assert disk["pass"], disk
-          EOF
+          docker run --rm ehpc-instant-umap:ci python /app/run_instant_job.py --help
+          docker run --rm -w /tmp -e PYTHONPATH=/app ehpc-instant-umap:ci python -c \
+            "from umap_job import cpu_inventory; c = cpu_inventory(); assert c['pass'] and c['summary'].get('model'), c"
+          # Synthetic MSI Zarr -> in-memory OSS -> the same run() the INSTANT job executes.
+          docker run --rm -v "$PWD/tests:/tests:ro" -w /tmp -e PYTHONPATH=/app -e REQUIRE_MASSFLOW=1 \
+            ehpc-instant-umap:ci python -m unittest discover -s /tests -p 'test_umap_job.py' -v
       - name: Check ACR login secrets
         if: github.event_name != 'pull_request'
         env:

@@ -8,17 +8,20 @@
   "oss_role_arn": "acs:ram::<account-id>:role/<oss-benchmark-role>",
   "resources": {
     "cores": 2,
-    "memory_gib": 4,
+    "memory_gib": 8,
     "system_disk_gib": 40
   },
-  "benchmark": {
+  "umap": {
     "oss_bucket": "<your-bucket>",
     "oss_region": "cn-hongkong",
     "oss_endpoint": "https://oss-cn-hongkong-internal.aliyuncs.com",
     "oss_prefix": "ehpc-benchmark",
-    "oss_size_mib": 1024,
-    "disk_dir": "/tmp/ehpc-benchmark",
-    "fio_size_mib": 1024,
-    "fio_runtime_seconds": 30
+    "source_zarr_path": "ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr",
+    "write_back": false,
+    "work_dir": "/tmp/umap-work",
+    "skip_ion_image_chunks": true,
+    "full_matrix_mib": 1024,
+    "sample_matrix_mib": 1024,
+    "max_fit_samples": 20000
   }
 }

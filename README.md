@@ -1,21 +1,22 @@
-# E-HPC INSTANT 基础设施测试
+# E-HPC INSTANT MassFlow UMAP
 
-本地填好配置后，通过 HTTPS OpenAPI 向 E-HPC INSTANT 提交一个容器作业。容器里依次做 CPU 信息采集、FIO 磁盘测试和 OSS 上传/下载测速，把可读结果写进 `run.log`，再连同完整 JSON 一起上传到 OSS。不需要 SSH、Slurm、登录节点或 NAS。
+本地填好配置后，通过 HTTPS OpenAPI 向 E-HPC INSTANT 提交一个容器作业。容器从 OSS 下载一个 MassFlow MSI Zarr 数据集，用 MassFlow 的 `plot_umap_image` 做 3 维 UMAP 降维，把结果（`analysis/umap` 数组、`umap_image.jpg`）和可读的 `run.log` 上传回 OSS。算法与原来 FC 函数（`scripts/index.py`）一致，不需要 SSH、Slurm、登录节点或 NAS。
 
 ```text
 ① 代码 → 镜像（GitHub Actions，push 自动触发）
-   git push → 单元测试 → 构建镜像 → 镜像内冒烟测试 → 推送到 ACR 公网地址
+   git push → 单元测试（含真实 UMAP）→ 构建镜像（pip 安装 massflow）
+            → 镜像内用 MassFlow 真实跑一次 UMAP（合成数据集）→ 推送到 ACR 公网地址
               crpi-y6a776c9l4k3agmh.cn-hongkong.personal.cr.aliyuncs.com/kawaru/sxo:{latest, sha-<commit>}
 
 ② 镜像 → 作业（本地执行 submit_instant.py）
-   读取 config/instant.local.json
-   → STS AssumeRole（临时凭证只允许写本次 run 的 OSS 前缀）
+   读取 config/instant.local.json（数据集可用 --dataset 临时替换）
+   → STS AssumeRole（临时凭证只能列举/读取该数据集，只能写本次 run 的 OSS 前缀）
    → INSTANT CreateJob，请求里包含：
        Container.Image          = 配置里的 image（ACR 专有网络地址）
        ImageRegistryOptions     = ACR_PULL_USERNAME / ACR_PULL_PASSWORD
        EnvironmentVars          = OSS STS 临时凭证
    → INSTANT 在你的香港 VPC 里用这组账号密码拉取镜像
-   → 运行 CPU / FIO / OSS 测试 → run.log 等结果上传 OSS
+   → 列举 → 下载（跳过 ion_image/intensity 数据块）→ UMAP → 结果与 run.log 上传 OSS
 ```
 
 ACR 和 INSTANT 之间没有任何控制台层面的“绑定”，唯一的连接就是每次 `CreateJob` 请求里写的镜像地址和拉取凭证。Actions 只负责把镜像推上 ACR，不读取本地配置，也不会提交作业。
@@ -26,21 +27,25 @@ ACR 和 INSTANT 之间没有任何控制台层面的“绑定”，唯一的连�
 |---|---|---|
 | ACR 镜像地址（公网）、命名空间、仓库名 | 仓库内 [.github/workflows/build-and-push-acr.yml](.github/workflows/build-and-push-acr.yml) 顶部 `env` | 不是秘密，Actions 构建推送需要 |
 | ACR 登录名、密码 | GitHub **Secrets**：`ACR_USERNAME`、`ACR_PASSWORD` | 密码不能进仓库 |
-| INSTANT 作业配置（地域、镜像、vSwitch、安全组、RAM 角色、Bucket、测试参数） | 本地 `config/instant.local.json`（被 `.gitignore` 排除） | 只有本地提交脚本用；本仓库是**公开**的，账号 ID、网络 ID 和 Bucket 名不宜公开 |
+| 打进镜像的 MassFlow 版本 | [image/requirements.txt](image/requirements.txt) 里的 `massflow==0.1.2`（PyPI） | 升级算法时改这一行，依赖由 pip 按 massflow 的声明安装 |
+| INSTANT 作业配置（地域、镜像、vSwitch、安全组、RAM 角色、Bucket、数据集、UMAP 参数） | 本地 `config/instant.local.json`（被 `.gitignore` 排除） | 只有本地提交脚本用；本仓库是**公开**的，账号 ID、网络 ID 和 Bucket 名不宜公开 |
 | 阿里云 AccessKey、ACR 拉取密码 | 本地 `.env`（被 `.gitignore` 排除，提交脚本自动加载） | 秘密，不能进仓库，也不会打进镜像 |
 
 `config/instant.local.json` 本身不含密码。如果把仓库改成私有，也可以把它提交进去；公开仓库下建议保留在本地。
 
-## 需求对照
+## 从 FC 迁移：对照
 
-| 需求 | 实现 | 说明 |
+| FC 原实现（`scripts/index.py`） | INSTANT 实现 | 说明 |
 |---|---|---|
-| 本地配置后提交作业 | `scripts/submit_instant.py`，官方 `EhpcInstant/2023-07-01` SDK 调 `CreateJob` / `GetJob` | `--dry-run` 不需要凭证，可先检查请求 |
-| OSS 上传、下载测速 | 单对象 PUT/GET，默认 1 GiB（`oss_size_mib: 1024`），记录耗时、MiB/s、SHA-256 校验，测完删除 | 单连接端到端吞吐，不是最大并发吞吐 |
-| 本地 SSD 测试（官方方法） | 8 组 FIO 负载，参数与[阿里云官方本地盘测试命令](https://www.alibabacloud.com/help/en/ecs/user-guide/test-the-performance-of-block-storage-devices)逐项一致 | 见下方“限制”：INSTANT 下测到的是容器所在磁盘 |
-| CPU 型号等 | `lscpu --json`：型号、厂商、架构、核数/线程、主频、L3、虚拟化；另记录 affinity 与 cgroup 限额 | 只采集信息，不做压力测试 |
-| 结果输出到日志并上传 OSS | `run.log` 逐行写可读结果；`result.json`、FIO 原始 JSON、`manifest.json` 一并上传 | 见“结果” |
-| push 自动构建并推送 ACR | `.github/workflows/build-and-push-acr.yml` | 所有分支 push、`v*` 标签、手动触发；PR 只构建不推送 |
+| HTTP 触发器 `handler`，入参 `run_id` / `source_zarr_path` | `submit_instant.py` 调 `CreateJob`；数据集取配置 `umap.source_zarr_path` 或 `--dataset` | `run_id` 由提交脚本生成 |
+| FC 函数角色注入的 STS 凭证 | 提交时 AssumeRole，会话策略收窄到“读该数据集 + 写本次 run 前缀”，经环境变量传入 | 本地长期 AccessKey 不进容器 |
+| 列举、路径校验、跳过 `ion_image/intensity` 数据块 | 原样移植（`scripts/umap_job.py`） | 该数组是 `spectra/intensity` 的离子主序副本，UMAP 不读取；元数据仍下载 |
+| 8 线程下载，条件 GET + 大小/ETag/CRC 校验，原子替换 | 原样移植 | 镜像编译了 `crcmod` C 扩展，CRC64 不拖慢下载 |
+| 按 `/tmp` 与 NAS 剩余空间选落盘位置 | 只用作业系统盘（`resources.system_disk_gib`），空间不足时报错并提示调大 | INSTANT 每个作业一台新机器，不需要 NAS |
+| 断点复用清单、900 秒时间预算 | 去掉 | 新机器上没有可复用的文件；运行时长不再受 FC 超时限制 |
+| 抽样预算 `UMAP_FULL_MATRIX_MB` 等环境变量 | `umap.full_matrix_mib` / `sample_matrix_mib` / `max_fit_samples`，逻辑相同 | 峰值内存写入 `run.log`，便于核对 8 GiB 是否够用 |
+| `plot_umap_image(save_matrix="zarr")` 写回源 Zarr，再增量上传变化文件 | 相同的快照差异；默认上传到本次 run 的 `zarr-delta/`，`write_back: true` 时写回源 Zarr | 测试数据默认只读，不会被改动 |
+| 成功/失败回调后端，`failure_handler` 兜底 | `manifest.json`（最后上传，`overall_pass`）+ INSTANT 作业状态 + 容器退出码 | 作业在 VPC 内且无公网 IP，暂不回调，见“限制” |
 
 ## 一、需要你配置的内容（一次性）
 
@@ -65,13 +70,18 @@ push 后到 GitHub **Actions** 页查看。成功后 ACR 里会出现以下标�
 - `sha-<完整 40 位 commit SHA>`：每次提交都有。需要固定到某次构建时，把配置里的 `:latest` 换成它。
 - 分支名 / `v*` 标签名。
 
-镜像里记录了构建时的 commit，`run.log` 第一行的 `image_git_sha=` 会显示本次测试实际用的是哪次提交。
+镜像里记录了构建时的 commit，`run.log` 第一行的 `image_git_sha=` 会显示本次作业实际用的是哪次提交，第二行 `packages` 记录实际安装的 massflow、umap-learn、numba、numpy 等版本。
 
-### 2. OSS Bucket
 
-直接使用已有的 `official-oss`（中国香港，私有）。测试只会写入 `official-oss/ehpc-benchmark/<run-id>/...` 这个前缀：1 GB 的测速对象测完会删除，只留下日志和结果文件。
+### 2. OSS Bucket 与数据集
 
-Bucket 概览里的“文件可以被公共访问”，意思是没有开启“阻止公共访问”。它不代表文件已经公开：Bucket 读写权限是私有，测试上传的对象也继承私有权限。如果这个 Bucket 不需要对外公开任何文件，建议在“权限控制 → 阻止公共访问”里开启。
+直接使用已有的 `official-oss`（中国香港，私有）。
+
+- 数据集是 MassFlow 预处理输出的 Zarr 目录，按原样上传到 OSS，例如当前测试数据：`official-oss/ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr/`（约 50 MiB、20346 像素 × 836 个 m/z）。
+- 作业默认只**读取**数据集，结果写到 `official-oss/ehpc-benchmark/<run-id>/...`，测试数据不会被改动。
+- 换数据集：把新的 `.zarr` 目录上传到 `ehpc-benchmark/` 下任意位置，提交时加 `--dataset`（见“运行”）。放在 `ehpc-benchmark/` 以外的前缀，需要同步放宽 3.1 的角色策略。
+
+Bucket 概览里的“文件可以被公共访问”，意思是没有开启“阻止公共访问”。它不代表文件已经公开：Bucket 读写权限是私有，作业上传的对象也继承私有权限。如果这个 Bucket 不需要对外公开任何文件，建议在“权限控制 → 阻止公共访问”里开启。
 
 ### 3. RAM：一个角色 + 一个用户
 
@@ -79,10 +89,10 @@ Bucket 概览里的“文件可以被公共访问”，意思是没有开启“�
 
 | 身份 | 谁用 | 权限 |
 |---|---|---|
-| RAM **角色** `ehpc-oss-benchmark` | 作业容器，通过 STS 临时凭证使用 | 只能对 `official-oss/ehpc-benchmark/*` 执行 Put/Get/Delete |
+| RAM **角色** `ehpc-oss-benchmark` | 作业容器，通过 STS 临时凭证使用 | 只能在 `official-oss/ehpc-benchmark/*` 下列举（ListObjects）、读取（Get）和写入（Put） |
 | RAM **用户** `ehpc-submitter` | 你的本地电脑，AccessKey 写在 `.env` | 提交/查询 INSTANT 作业，以及扮演上面这个角色 |
 
-每次提交时，脚本会用 RAM 用户申请一组 1 小时有效的临时凭证，并额外限制它只能写本次 run 的目录，然后交给容器使用。本地的长期 AccessKey 不会离开你的电脑。
+每次提交时，脚本会用 RAM 用户申请一组 1 小时有效的临时凭证，并额外限制它只能列举和读取本次的数据集、只能写本次 run 的目录，然后交给容器使用。本地的长期 AccessKey 不会离开你的电脑。
 
 主账号 AccessKey 不能用，因为主账号不能调用 AssumeRole。
 
@@ -90,7 +100,7 @@ Bucket 概览里的“文件可以被公共访问”，意思是没有开启“�
 
 **3.1 创建容器用的角色**
 
-如果已经有一个信任“当前云账号”、并带 OSS 权限的普通角色（例如 `AliyunOSSFullAccess`），可以跳过 3.1，直接把它的 ARN 填进 `oss_role_arn`。脚本申请临时凭证时附带的会话策略，会把权限缩小到 `<bucket>/<oss_prefix>/<run-id>/*` 的 Put/Get/Delete，最终权限取两者的交集。服务关联角色（`AliyunServiceRoleFor...`）只能由云服务自己扮演，不能用在这里。
+如果已经有一个信任“当前云账号”、并带 OSS 权限的普通角色（例如 `AliyunOSSFullAccess`），可以跳过 3.1，直接把它的 ARN 填进 `oss_role_arn`。脚本申请临时凭证时附带的会话策略，会把权限缩小到“数据集前缀的 ListObjects/Get + `<bucket>/<oss_prefix>/<run-id>/*` 的 Put”，最终权限取两者的交集。服务关联角色（`AliyunServiceRoleFor...`）只能由云服务自己扮演，不能用在这里。
 
 1. 权限管理 → 权限策略 → 创建权限策略 → 脚本编辑。
    - 粘贴 [config/oss-policy.example.json](config/oss-policy.example.json)，把 `<your-bucket>` 换成 `official-oss`。
@@ -101,6 +111,8 @@ Bucket 概览里的“文件可以被公共访问”，意思是没有开启“�
    - 创建后得到的信任策略与 [config/oss-role-trust-policy.example.json](config/oss-role-trust-policy.example.json) 相同。
 3. 角色详情 → 权限管理 → 新增授权，选择自定义策略 `ehpc-oss-benchmark`。
 4. 复制角色详情页的 **ARN**（形如 `acs:ram::<账号ID>:role/ehpc-oss-benchmark`），填到配置的 `oss_role_arn`。
+
+**从 FIO/OSS 测速版本升级的注意**：旧版策略只有 Put/Get/Delete，没有 `oss:ListObjects`，作业会在列举数据集时报 `AccessDenied`。请把角色上的自定义策略更新为新的 [config/oss-policy.example.json](config/oss-policy.example.json)。如果角色挂的是 `AliyunOSSFullAccess`，不用改。
 
 角色的“最大会话时间”默认 3600 秒，够用。只有在把 `--wait-timeout` 设到 2700 秒以上时，才需要调大它。
 
@@ -173,11 +185,15 @@ cp .env.example .env && chmod 600 .env                     # 已被 .gitignore �
 | `vswitch_id` / `security_group_id` | 第 4 步创建的交换机和安全组 |
 | `enable_external_ip` | 是否给作业分配公网 IP，默认 `false` |
 | `oss_role_arn` | 第 3.1 步的角色 ARN |
-| `resources.cores` / `memory_gib` / `system_disk_gib` | 作业规格，默认 2 核 / 4 GiB / 40 GiB。系统盘要能装下 FIO 文件和 2 倍 OSS 测试对象 |
-| `resources.instance_types`（可选） | 最多 5 个实例规格，例如 `["ecs.g7.large"]`，用于固定 CPU 代际 |
-| `benchmark.oss_*` | Bucket（`official-oss`）、地域、内网 Endpoint、归档前缀、测速对象大小（默认 1024 MiB） |
-| `benchmark.disk_dir` | 容器内的 FIO 测试目录，默认 `/tmp/ehpc-benchmark`。不要指向 `/dev` 或 `/` |
-| `benchmark.fio_size_mib` / `fio_runtime_seconds` | FIO 文件大小和每组运行时长。官方为每组 1000 秒，这里默认 30 秒 |
+| `resources.cores` / `memory_gib` / `system_disk_gib` | 作业规格。当前使用 `ecs.c9a.xlarge`：4 核 / 8 GiB / 100 GiB。系统盘要能装下下载量再加 1 GiB 余量；内存要覆盖 UMAP 峰值（测试数据约 1 GiB，见 `run.log` 的 `peak_rss`） |
+| `resources.instance_types`（可选） | 最多 5 个实例规格，例如 `["ecs.g7.large"]`，用于固定 CPU 代际。按顺序尝试，全部售罄时作业不会自动改用其他规格。不写时 INSTANT 会按核数和内存自选规格，成功率最高 |
+| `resources.fallback_any_type`（可选） | 默认 `false`。设为 `true` 时，如果 CreateJob 返回售罄错误（如 `RecommendEmpty.InstanceTypeSoldOut`），会去掉 `instance_types` 再提交一次，改由 INSTANT 自选规格。只对这一种错误重试，此时服务端没有创建作业，所以不会重复运行 |
+| `umap.oss_*` | Bucket（`official-oss`）、地域、内网 Endpoint、结果归档前缀（`ehpc-benchmark`） |
+| `umap.source_zarr_path` | 数据集的 OSS 前缀（不含 bucket，以 `.zarr` 结尾），当前为 `ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr`。`--dataset` 可临时覆盖 |
+| `umap.write_back` | 默认 `false`：结果放到本次 run 的 `zarr-delta/`，数据集只读。`true`：与 FC 一样把 `analysis/umap` 写回源 Zarr，会话策略只额外放开 `<数据集>/analysis/*` 的写入 |
+| `umap.work_dir` | 容器内下载和计算目录，默认 `/tmp/umap-work`（系统盘）。不要指向 `/dev` 或 `/` |
+| `umap.skip_ion_image_chunks` | 默认 `true`，跳过 `ion_image/intensity` 数据块（测试数据可少下载约 40%）。`false` 为完整下载 |
+| `umap.full_matrix_mib` / `sample_matrix_mib` / `max_fit_samples` | 同 FC：float32 矩阵不超过 `full_matrix_mib`（1024）时全量拟合；超过时抽样，样本数不超过 `max_fit_samples`（20000）且样本矩阵不超过 `sample_matrix_mib`（1024） |
 
 **`.env`（秘密）**：提交脚本每次运行都会自动读取，不需要手动 `export`。终端里已经 export 的同名变量优先。
 
@@ -194,17 +210,21 @@ ALIBABA_CLOUD_ECS_METADATA_DISABLED=true
 ## 二、运行
 
 ```bash
-# 1) 预览：校验配置，按官方 SDK 模型检查请求；不需要凭证，不调用任何 API
+# 1) 预览：校验配置，按官方 SDK 模型检查请求和 STS 会话策略；不需要凭证，不调用任何 API
 python scripts/submit_instant.py --config config/instant.local.json --dry-run
 
-# 2) 提交并等待结束（默认最多等 1800 秒）
+# 2) 用配置里的数据集提交并等待结束（默认最多等 1800 秒）
 python scripts/submit_instant.py --config config/instant.local.json --wait
 
-# 3) 只查询已有作业，不会重复提交
+# 3) 换一个数据集：OSS key 前缀或控制台复制的 oss:// 地址都可以，末尾的 / 可有可无
+python scripts/submit_instant.py --dataset ehpc-benchmark/test_data/<其他数据集>.zarr --wait
+python scripts/submit_instant.py --dataset oss://official-oss/ehpc-benchmark/test_data/<其他数据集>.zarr/ --wait
+
+# 4) 只查询已有作业，不会重复提交
 python scripts/submit_instant.py --config config/instant.local.json --job-id job-xxxxxxxx --wait-timeout 1800
 ```
 
-提交成功后会打印 `run_id`、`job_id` 和 OSS 归档前缀，并保存到本地 `work/<run-id>/submission.json`。
+提交成功后会打印 `run_id`、`job_id`、实际请求的实例规格（`instance_types`，回退后为 `any`）、数据集地址、结果地址和 OSS 归档前缀，并保存到本地 `work/<run-id>/submission.json`。作业失败时还会打印 INSTANT 给出的失败原因（`StatusReason`）。
 
 本地退出码：
 
@@ -218,72 +238,81 @@ python scripts/submit_instant.py --config config/instant.local.json --job-id job
 注意事项：
 
 - 如果 `CreateJob` 报错，作业仍可能已经创建。请先到控制台确认，再决定是否重新提交。
-- STS 有效期取 `max(3600, wait-timeout + 900)` 秒，需要覆盖“排队 + 拉镜像 + 测试 + 归档”的全过程。
-- 调大 `--wait-timeout` 或 `fio_runtime_seconds` 时，要同步调大角色的最大会话时间。
+- STS 有效期取 `max(3600, wait-timeout + 900)` 秒，需要覆盖“排队 + 拉镜像 + 下载 + UMAP + 上传”的全过程。大数据集请调大 `--wait-timeout`。
+- 调大 `--wait-timeout` 时，要同步调大角色的最大会话时间。
 
 ## 三、结果
 
 ```text
 oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/
-  run.log            可读的逐行结果（见下）
-  result.json        全部原始数据：lscpu JSON、findmnt/lsblk、每组 FIO 指标、OSS 测速
-  fio-prefill.json   FIO 预填充
-  fio-<profile>.json 每组 FIO 的完整 JSON 输出
-  oss-upload.json    每个文件的上传状态
-  manifest.json      最后上传；overall_pass=true 表示测试全部通过且归档完整
+  run.log            可读的逐行日志（见下）；失败时包含错误和 Python 调用栈
+  result.json        全部数据：CPU 信息、数据集统计、各阶段耗时、抽样参数、峰值内存、结果文件列表
+  umap_image.jpg     UMAP 前三维映射成 RGB 的空间图像
+  massflow.log       MassFlow 自身的日志
+  zarr-delta/        UMAP 新增到 Zarr 的文件（write_back=false 时），与源 Zarr 叠加即得到完整结果：
+    analysis/umap/scaled_embedding/...   每个像素的 3 维嵌入（0～1 缩放）
+    analysis/umap/coordinates/...        对应的 0 起始像素坐标
+  oss-upload.json    每个归档文件的上传状态
+  manifest.json      最后上传；overall_pass=true 表示 UMAP 成功且结果、日志全部上传
 ```
 
-`run.log` 格式如下（数值为占位）：
+`write_back: true` 时，`analysis/umap/...` 直接写回 `<数据集>.zarr/analysis/umap/`（与 FC 行为相同），`zarr-delta/` 不再生成。
+
+`run.log` 示例（本地用测试数据集跑出的真实数值；机器不同，耗时会不同）：
 
 ```text
+... start run=<run-id> attempt=<attempt-id> host=... image_git_sha=...
+... packages massflow=0.1.2 umap-learn=... pynndescent=... numba=... numpy=... scikit-learn=... zarr=...
 ... cpu model: <型号> (<厂商>, x86_64)
-... cpu topology: cpus=2 sockets=1 cores/socket=1 threads/core=2 max_mhz=... l3=... hypervisor=KVM
-... disk target=/tmp/ehpc-benchmark fstype=overlay source=overlay runtime=30s/profile physical_local_ssd_verified=false
-... fio seqwrite          write     bs=128k iodepth=128 numjobs=1 bw=...MiB/s iops=... lat_mean=...us lat_p99=...us
-... fio randread          randread  bs=4k   iodepth=32  numjobs=4 bw=...MiB/s iops=... lat_mean=...us lat_p99=...us
-... oss upload: ...MiB/s (...s)
-... oss download: ...MiB/s (...s)
-... oss sha256_match=True cleanup=passed error=None
+... dataset oss://official-oss/ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr/ objects=239 size=50.3MiB download=29.9MiB skipped_ion_image_chunks=70
+... finish download ...s
+... finish umap 10.1s
+... umap pixels=20346 features=836 matrix=64.9MiB fit_samples=20346 sample_ratio=1.000000
+... upload 6 new zarr files -> oss://official-oss/ehpc-benchmark/<run-id>/<attempt-id>/zarr-delta/
+... umap_pass=True peak_rss=974.9MiB stages_seconds={'list': ..., 'download': ..., 'umap': ..., 'upload': ...}
 ```
 
-以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。
+以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。`umap` 阶段包含 numba 首次 JIT 编译，在新机器上每次都会发生，通常几十秒。
 
-容器退出码：`0` 全部通过，`2` 有测试失败，`3` 归档失败，`64` 启动配置或凭证错误。如果镜像拉取失败、容器被强制终止，或 OSS 完全不可达，OSS 上可能没有日志，这时请查看 INSTANT 控制台。
+容器退出码：`0` 成功，`2` UMAP 流水线失败（列举、下载、计算或结果上传），`3` 日志/manifest 归档失败，`64` 启动配置或凭证错误。这些退出码不会触发 INSTANT 重试；被 OOM 杀掉等其他退出码会按 `RetryCount: 1` 在新机器上重跑一次。如果镜像拉取失败、容器被强制终止，或 OSS 完全不可达，OSS 上可能没有日志，这时请查看 INSTANT 控制台。
 
 ## 四、限制
 
-- **INSTANT 不暴露物理本地 NVMe 盘。** `CreateJob` 的 `Resource.Disks` 目前只支持 `System`，挂载方式只支持 NAS/OSS。
-  - FIO 实际测的是容器 `/tmp` 所在的文件系统，通常是系统云盘上的 overlay。结果会记录 `findmnt`/`lsblk`，并固定标记 `physical_local_ssd_verified=false`。
-  - FIO 的块大小、队列深度和并发数与官方本地盘方法一致。但官方是裸盘、每组 1000 秒，这里是文件型、默认每组 30 秒，结果不能直接等同官方裸盘数据。
-  - 如果必须测物理本地 SSD，需要换用带本地盘的 ECS 实例（如 i 系列）直接跑 FIO，或者先向阿里云确认 INSTANT 是否支持。
-- OSS 数值是单连接端到端吞吐，包含 SDK 和本地文件读写开销。
+- **没有回调后端。** FC 版本在结束时回调 `CLUSTERING_FC_CALLBACK_URL`。INSTANT 作业默认在 VPC 内、没有公网 IP，接入后端时二选一：
+  - 后端直接调用 `CreateJob`（逻辑同 `submit_instant.py`），再轮询 `GetJob` 或读取 `manifest.json` 判断终态。不需要改网络，推荐。
+  - 在容器里回调：需要 VPC 有 NAT 网关或后端在同一 VPC，并把回调 Token 作为环境变量传入。
+- **UMAP 调用不能中途打断。** 与 FC 相同，native 的 UMAP 计算期间无法做协作式检查；内存不足时进程会被系统杀掉，只能从 INSTANT 控制台和缺失的 `manifest.json` 判断。数据集变大时先看 `run.log` 的 `peak_rss`，必要时调小 `sample_matrix_mib` 或换更大内存的规格。
+- **不设最大源文件限制。** FC 的 `FC_MAX_FILE_SIZE_MB`（20 GiB）是因为 `/tmp` 和 NAS 有限；这里只检查系统盘剩余空间，不够时报 `ENOSPC` 并提示调大 `system_disk_gib`。
 - STS 临时凭证通过容器环境变量传入：
   - 有权限查看作业配置的人能看到这些值。
-  - 凭证已被会话策略限制在本次 run 的前缀内，并且会自动过期。
+  - 凭证已被会话策略限制在本次数据集和本次 run 的前缀内，并且会自动过期。
   - 本地 API 的 AccessKey 不会传进容器。
 
 ## 开发
 
+MassFlow 要求 Python 3.12 及以上，完整测试需要 3.12 环境（本地提交脚本仍可在 3.9 上运行）：
+
 ```bash
-pip install -r requirements.txt -r image/requirements.txt
+uv venv --python 3.12 .venv312 && source .venv312/bin/activate
+uv pip install -r requirements.txt -r image/requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-离线测试覆盖以下内容：
+- `tests/test_submit.py`：SDK 请求结构、参数分块、实例规格与售罄回退、STS 会话策略（数据集只读、只写本次 run）、`--dataset` 解析、凭证脱敏、终态等待。
+- `tests/test_umap_job.py`：列举与路径校验、`ion_image` 数据块跳过、ETag 校验与部分文件清理、抽样预算、结果写到 `zarr-delta/` 或写回源 Zarr、失败日志与 OSS 错误脱敏、归档失败退出码。
+- 其中 `MassFlowIntegrationTests` 用 MassFlow 写一个合成 MSI Zarr，经内存版 OSS 走完整的 `run()`，是真实的 UMAP 计算。CI 的单元测试和镜像冒烟测试（`REQUIRE_MASSFLOW=1`）都会运行它；没装 MassFlow 时自动跳过。
 
-- SDK 请求结构、参数分块、实例规格
-- STS 会话策略范围、凭证脱敏
-- 终态等待、超时不取消作业
-- OSS 数据校验和清理、归档失败的退出码
-- `run.log` 可读结果、`lscpu` 解析
+在本地用真实数据集跑同一个流程：
 
-CI 还会在构建出的镜像里实际运行 `lscpu` 和短时 FIO。真实的 INSTANT/ACR/OSS 连通性需要填好账号配置后首次联调才能验证。
+```bash
+UMAP_TEST_ZARR=/path/to/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr \
+  python -m unittest discover -s tests -p test_umap_job.py -k test_real_umap
+```
 
 ## 官方依据
 
 - [INSTANT CreateJob](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/developer-reference/api-ehpcinstant-2023-07-01-createjob)
 - [INSTANT GetJob](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/developer-reference/api-ehpcinstant-2023-07-01-getjob)
 - [INSTANT 服务关联角色](https://help.aliyun.com/zh/e-hpc/e-hpc-instant/security-and-compliance/service-linked-role-of-e-hpc-instant-service)
-- [块存储/本地盘 FIO 测试方法](https://www.alibabacloud.com/help/en/ecs/user-guide/test-the-performance-of-block-storage-devices)
 - [STS AssumeRole](https://help.aliyun.com/zh/ram/developer-reference/api-sts-2015-04-01-assumerole)
 - [ACR 推送/拉取镜像](https://help.aliyun.com/zh/acr/getting-started/use-a-container-registry-enterprise-edition-instance-to-push-and-pull-images)

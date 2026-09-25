@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Container entry point: test, archive logs, return failure on upload failure."""
+"""Container entry point: run MassFlow UMAP on an OSS Zarr dataset, upload results and logs."""
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+from importlib import metadata
 import json
 import os
 from pathlib import Path
+import resource
+import shutil
 import socket
+import sys
 import tempfile
 import time
+import traceback
 import uuid
 
-from benchmark import cpu_inventory, error_name, fio_benchmark, oss_benchmark, summarize, validate_settings
+from umap_job import (check_disk_space, cpu_inventory, cpu_lines, diff_snapshot, download_objects, error_detail,
+                      error_name, list_source_objects, run_umap, snapshot_dir, split_download_objects,
+                      upload_files, validate_settings)
 
 
 def make_bucket(settings: dict):
@@ -29,16 +36,34 @@ def make_bucket(settings: dict):
         raise ValueError("runtime OSS STS token has expired")
     auth = oss2.StsAuth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"],
                         "".join(parts), auth_version="v4")
-    # oss2's CRC64 falls back to pure Python (~20 MiB/s) without a compiler, which would cap the
-    # measured throughput; the benchmark verifies SHA-256 outside the timed transfer instead.
+    # CRC64 stays on: this moves real data. The image compiles crcmod's C extension for speed.
     return oss2.Bucket(auth, settings["oss_endpoint"], settings["oss_bucket"],
-                       region=settings["oss_region"], connect_timeout=60, enable_crc=False)
+                       region=settings["oss_region"], connect_timeout=60)
 
 
-def run(settings: dict, bucket, output: Path) -> int:
+def package_versions() -> dict:
+    """Numerical stack actually installed, since only massflow itself is pinned."""
+    versions = {}
+    for name in ("massflow", "umap-learn", "pynndescent", "numba", "numpy", "scikit-learn", "zarr"):
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def peak_rss_mib() -> float:
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / 2**20 if sys.platform == "darwin" else rss / 1024  # bytes on macOS, KiB on Linux
+
+
+def run(settings: dict, bucket, output: Path, work: Path) -> int:
     output.mkdir(parents=True, exist_ok=True)
     attempt = uuid.uuid4().hex[:12]
     prefix = f"{settings['oss_prefix'].strip('/')}/{settings['run_id']}/{attempt}"
+    source = settings["source_zarr_path"]
+    # Test runs keep the dataset read-only; write_back stores analysis/umap in the source like FC did.
+    results_prefix = source if settings["write_back"] else f"{prefix}/zarr-delta"
     log_path = output / "run.log"
 
     def log(message):
@@ -47,32 +72,70 @@ def run(settings: dict, bucket, output: Path) -> int:
         with log_path.open("a") as stream:
             stream.write(line + "\n")
 
+    def stage(name, operation):
+        log(f"start {name}")
+        start = time.perf_counter()
+        value = operation()
+        result["stages_seconds"][name] = round(time.perf_counter() - start, 3)
+        log(f"finish {name} {result['stages_seconds'][name]:.1f}s")
+        return value
+
+    bucket_url = f"oss://{settings['oss_bucket']}"
     result = {"run_id": settings["run_id"], "attempt_id": attempt,
-              "image_git_sha": os.getenv("IMAGE_GIT_SHA"),
+              "image_git_sha": os.getenv("IMAGE_GIT_SHA"), "packages": package_versions(),
               "job_id": os.getenv("EHPC_JOB_ID"), "executor_id": os.getenv("EHPC_EXECUTOR_ID"),
-              "hostname": socket.gethostname(), "settings": settings, "checks": {}}
+              "hostname": socket.gethostname(), "settings": settings,
+              "source": f"{bucket_url}/{source}/", "results": f"{bucket_url}/{results_prefix}/",
+              "stages_seconds": {}, "umap_pass": False}
     log(f"start run={settings['run_id']} attempt={attempt} host={result['hostname']} "
         f"image_git_sha={result['image_git_sha']}")
-    for name, operation in (
-        ("cpu", cpu_inventory),
-        ("disk", lambda: fio_benchmark(settings, output)),
-        ("oss", lambda: oss_benchmark(bucket, settings, prefix)),
-    ):
-        log(f"start {name}")
-        try:
-            result["checks"][name] = operation()
-        except Exception as exc:
-            result["checks"][name] = {"pass": False, "error": type(exc).__name__}
-        log(f"finish {name} pass={result['checks'][name]['pass']}")
-        try:
-            lines = summarize(name, result["checks"][name])
-        except Exception as exc:
-            lines = [f"{name} summary unavailable: {type(exc).__name__}"]
-        for line in lines:
+    log("packages " + " ".join(f"{name}={version}" for name, version in result["packages"].items()))
+    try:
+        result["cpu"] = cpu_inventory()
+        for line in cpu_lines(result["cpu"]):
             log(line)
-    result["tests_pass"] = all(item["pass"] for item in result["checks"].values())
+    except Exception as exc:  # inventory is informational and must not fail the analysis
+        result["cpu"] = {"pass": False, "error": error_name(exc)}
+
+    try:
+        objects = stage("list", lambda: list_source_objects(bucket, source))
+        download, skipped = split_download_objects(objects, source, settings["skip_ion_image_chunks"])
+        download_bytes = sum(obj["size"] for obj in download)
+        result["dataset"] = {"objects": len(objects), "bytes": sum(obj["size"] for obj in objects),
+                             "downloaded_objects": len(download), "downloaded_bytes": download_bytes,
+                             "skipped_ion_image_chunks": len(skipped)}
+        log(f"dataset {result['source']} objects={len(objects)} "
+            f"size={result['dataset']['bytes'] / 2**20:.1f}MiB download={download_bytes / 2**20:.1f}MiB "
+            f"skipped_ion_image_chunks={len(skipped)}")
+        local_source = work / Path(source).name
+        check_disk_space(work, download_bytes)
+        stage("download", lambda: download_objects(bucket, download, source, local_source))
+        before = snapshot_dir(local_source)
+        umap = stage("umap", lambda: run_umap(settings, local_source, output / "umap_image.jpg"))
+        result["umap"] = umap
+        log(f"umap pixels={umap['pixels']} features={umap['features']} matrix={umap['matrix_mib']:.1f}MiB "
+            f"fit_samples={umap['fit_samples']} sample_ratio={umap['sample_ratio']:.6f}")
+        changed = diff_snapshot(before, snapshot_dir(local_source))
+        result["result_files"] = changed
+        log(f"upload {len(changed)} new zarr files -> {result['results']}")
+        stage("upload", lambda: upload_files(bucket, local_source, changed, results_prefix))
+        result["umap_pass"] = True
+    except Exception as exc:
+        result["error"] = error_detail(exc)
+        log(f"umap pipeline FAILED: {result['error']}")
+        if result["error"] != error_name(exc):  # OSS errors are reduced to class and code only
+            for line in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).splitlines():
+                log(f"  {line}")
+    result["peak_rss_mib"] = round(peak_rss_mib(), 1)
+    log(f"umap_pass={result['umap_pass']} peak_rss={result['peak_rss_mib']}MiB "
+        f"stages_seconds={result['stages_seconds']}")
+
+    # MassFlow logs to logs/ under the working directory, which main() points at the work dir.
+    massflow_log = Path("logs") / "massflow.log"
+    if massflow_log.is_file():
+        shutil.copyfile(massflow_log, output / "massflow.log")
     (output / "result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
-    log(f"tests finished tests_pass={result['tests_pass']}; archiving to oss://{settings['oss_bucket']}/{prefix}/")
+    log(f"archiving logs to {bucket_url}/{prefix}/")
     uploads = []
     upload_failed = False
     for path in sorted(output.iterdir()):
@@ -90,9 +153,10 @@ def run(settings: dict, bucket, output: Path) -> int:
     except Exception:
         upload_failed = True
     manifest = {"run_id": settings["run_id"], "attempt_id": attempt, "job_id": result["job_id"],
-                "oss_prefix": f"oss://{settings['oss_bucket']}/{prefix}/",
-                "tests_pass": result["tests_pass"], "artifacts_uploaded": not upload_failed,
-                "overall_pass": result["tests_pass"] and not upload_failed}
+                "oss_prefix": f"{bucket_url}/{prefix}/", "source": result["source"],
+                "results": result["results"], "umap_pass": result["umap_pass"],
+                "artifacts_uploaded": not upload_failed,
+                "overall_pass": result["umap_pass"] and not upload_failed}
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     try:
@@ -103,20 +167,24 @@ def run(settings: dict, bucket, output: Path) -> int:
         manifest.update(overall_pass=False, artifacts_uploaded=False, manifest_upload_failed=True)
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, ensure_ascii=False), flush=True)
-    return 3 if upload_failed else (0 if result["tests_pass"] else 2)
+    return 3 if upload_failed else (0 if result["umap_pass"] else 2)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # INSTANT limits argument length, so the submitter may split the JSON into several arguments.
-    parser.add_argument("--settings-json", required=True, nargs="+", help="non-secret benchmark settings")
+    parser.add_argument("--settings-json", required=True, nargs="+", help="non-secret umap settings")
     args = parser.parse_args()
     try:
         settings = json.loads("".join(args.settings_json))
         validate_settings(settings, runtime=True)
         bucket = make_bucket(settings)
-        with tempfile.TemporaryDirectory(prefix="instant-results-") as directory:
-            return run(settings, bucket, Path(directory))
+        work_root = Path(settings["work_dir"])
+        work_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="umap-", dir=work_root) as work, \
+                tempfile.TemporaryDirectory(prefix="instant-results-") as output:
+            os.chdir(work)  # MassFlow creates logs/ in the working directory on import
+            return run(settings, bucket, Path(output), Path(work))
     except Exception as exc:
         print(f"job setup failed: {error_name(exc)}; check settings and OSS STS credentials", flush=True)
         return 64
