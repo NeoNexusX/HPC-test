@@ -103,6 +103,25 @@ class UmapJobTests(unittest.TestCase):
             umap_job.check_disk_space(Path(directory), 2**60)
         self.assertIn("system_disk_gib", str(ctx.exception))
 
+    def test_validate_settings_allows_optional_benchmark_labels(self):
+        base = dict(config()["umap"], run_id="run-1")
+        umap_job.validate_settings(base, runtime=True)
+        umap_job.validate_settings(dict(base, benchmark_labels={"instance_type": "ecs.c7.large", "cores": 2}),
+                                   runtime=True)
+        for bad in ({"bad key": "x"}, {"model": "x" * 300}, {"flag": True}, "not-a-dict"):
+            with self.assertRaises(ValueError, msg=bad):
+                umap_job.validate_settings(dict(base, benchmark_labels=bad), runtime=True)
+        with self.assertRaises(ValueError):
+            umap_job.validate_settings(dict(base, unknown="x"), runtime=True)
+
+    def test_throughput_reports_speed_and_guards_zero_seconds(self):
+        metrics = runner.throughput({"download": 2.0, "umap": 4.0, "upload": 0},
+                                    2 * 2**20, 1 * 2**20, {"matrix_mib": 8.0, "pixels": 100})
+        self.assertEqual(metrics["download"], {"seconds": 2.0, "mib": 2.0, "mib_per_s": 1.0})
+        self.assertEqual(metrics["compute"]["mib_per_s"], 2.0)
+        self.assertEqual(metrics["compute"]["pixels_per_s"], 25.0)
+        self.assertIsNone(metrics["upload"]["mib_per_s"])  # a zero-second stage cannot report a rate
+
     def test_lscpu_summary_handles_nested_and_flat_output(self):
         nested = {"lscpu": [
             {"field": "Architecture:", "data": "x86_64"},
@@ -148,6 +167,30 @@ class RunnerTests(unittest.TestCase):
         result = json.loads(files["result.json"])
         self.assertEqual(result["dataset"]["skipped_ion_image_chunks"], 1)
         self.assertEqual(set(result["stages_seconds"]), {"list", "download", "import", "umap", "upload"})
+        # Node metrics: time and speed of each data-moving stage, plus the disk the job ran on.
+        self.assertEqual(set(result["throughput"]), {"download", "compute", "upload"})
+        self.assertEqual(result["throughput"]["compute"]["pixels"], 120)
+        self.assertIn("total_gib", result["disk"])
+        self.assertIn("uploaded_bytes", result["dataset"])
+        self.assertIn("throughput download", files["run.log"])
+        self.assertIn("disk work_dir", files["run.log"])
+
+    @patch.object(runner, "run_umap", side_effect=fake_umap)
+    def test_local_copy_is_cleaned_after_successful_upload(self, *_):
+        # The uploaded local Zarr copy must be removed once results are safely in OSS.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "work").mkdir()
+            code = runner.run(settings(base / "work"), Bucket(dataset()), base / "out", base / "work")
+            self.assertEqual(code, 0)
+            self.assertFalse((base / "work" / "sample.zarr").exists())
+
+    @patch.object(runner, "run_umap", side_effect=fake_umap)
+    def test_benchmark_labels_are_echoed_into_result(self, *_):
+        labels = {"instance_type": "ecs.c7.large", "cores": 2, "batch_id": "b1", "repeat_index": 3}
+        code, files = self.run_job(Bucket(dataset()), benchmark_labels=labels)
+        self.assertEqual(code, 0, files["run.log"])
+        self.assertEqual(json.loads(files["result.json"])["benchmark_labels"], labels)
 
     @patch.object(runner, "run_umap", side_effect=fake_umap)
     def test_write_back_stores_analysis_in_source_zarr(self, *_):

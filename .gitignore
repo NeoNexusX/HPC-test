@@ -203,6 +203,7 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 config/instant.local.json
+config/*.local.json
 secrets/
 work/
 

@@ -274,6 +274,72 @@ def wait_for_job(client, job_id: str, timeout: int, interval: int) -> int:
     return 4
 
 
+def new_run_id() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+
+
+def report_error(stage: str, exc: Exception) -> int:
+    """Print a diagnostic that never echoes the request payload (it carries credentials); return 1."""
+    if isinstance(exc, (ValueError, OSError, ImportError)):
+        print(f"Configuration error ({type(exc).__name__}); check config, dependencies and credentials.", file=sys.stderr)
+        if isinstance(exc, (ValueError, ImportError)) and not isinstance(exc, json.JSONDecodeError):
+            print(str(exc), file=sys.stderr)
+        return 1
+    # Server error code/message help diagnose RAM, quota and network setup; never print the request.
+    exc = getattr(exc, "inner_exception", None) or exc  # SDK wraps credential/network errors
+    code = getattr(exc, "code", None)
+    if type(exc).__name__ == "CredentialException":  # lists why each local credential source failed
+        code = code or "LocalCredentials"
+    detail = f": {code}" if code else ""
+    print(f"{stage} failed ({type(exc).__name__}{detail})", file=sys.stderr)
+    if stage == "CreateJob":
+        print("The job may still have been created; check the INSTANT console before resubmitting.", file=sys.stderr)
+    return 1
+
+
+def submit_and_wait(config: dict, run_id: str, args, *, client=None, sts_client=None) -> tuple[int, dict | None]:
+    """AssumeRole, CreateJob (with sold-out fallback), archive the submission and wait if asked.
+
+    Returns (exit_code, summary). Errors are formatted here and returned as (1, None) so a batch
+    of runs can continue to the next one; the summary is None only when nothing was submitted.
+    """
+    stage = "AssumeRole"
+    try:
+        # STS must outlive queueing + image pull + tests + archive; the local wait is the proxy budget.
+        credentials = assume_oss_role(sts_client or make_sts_client(config["region"]), config, run_id,
+                                      max(3600, args.wait_timeout + 900))
+        stage = "CreateJob"
+        client = client or make_client(config["region"])
+        # Do not automatically retry CreateJob: the API has no ClientToken field. The one exception
+        # is an explicit sold-out rejection, which guarantees no job was created.
+        try:
+            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
+        except Exception as exc:
+            resources = config["resources"]
+            if not (resources.get("fallback_any_type") and resources.get("instance_types") and sold_out(exc)):
+                raise
+            print(f"Instance types {resources['instance_types']} sold out; resubmitting without InstanceTypes "
+                  "(any type with the same cores/memory).", file=sys.stderr, flush=True)
+            config = copy.deepcopy(config)
+            del config["resources"]["instance_types"]
+            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
+        bucket = config["umap"]["oss_bucket"]
+        summary = {"run_id": run_id, "job_id": job_id, "image": config["image"],
+                   "instance_types": config["resources"].get("instance_types") or "any",
+                   "dataset": f"oss://{bucket}/{config['umap']['source_zarr_path']}/",
+                   "results": f"oss://{bucket}/{results_prefix(config, run_id)}/",
+                   "oss_prefix": f"oss://{bucket}/{run_prefix(config, run_id)}/"}
+        out = ROOT / "work" / run_id
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "submission.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps(summary, indent=2), flush=True)
+        stage = "GetJob"
+        code = wait_for_job(client, job_id, args.wait_timeout, args.poll_seconds) if args.wait else 0
+        return code, summary
+    except Exception as exc:
+        return report_error(stage, exc), None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(ROOT / "config" / "instant.local.json"))
@@ -301,7 +367,7 @@ def main() -> int:
         if args.job_id:
             stage = "GetJob"
             return wait_for_job(make_client(config["region"]), args.job_id, args.wait_timeout, args.poll_seconds)
-        run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+        run_id = new_run_id()
         if args.dry_run:
             request = build_request(config, run_id, registry_env={})
             sdk_model(request)
@@ -309,55 +375,9 @@ def main() -> int:
                               "oss_sts_session_policy": oss_session_policy(config, run_id)},
                              indent=2, ensure_ascii=False))
             return 0
-        stage = "AssumeRole"
-        # STS must outlive queueing + image pull + tests + archive; the local wait is the proxy budget.
-        credentials = assume_oss_role(make_sts_client(config["region"]), config, run_id,
-                                      max(3600, args.wait_timeout + 900))
-        stage = "CreateJob"
-        client = make_client(config["region"])
-        # Do not automatically retry CreateJob: the API has no ClientToken field. The one exception
-        # is an explicit sold-out rejection, which guarantees no job was created.
-        try:
-            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
-        except Exception as exc:
-            resources = config["resources"]
-            if not (resources.get("fallback_any_type") and resources.get("instance_types") and sold_out(exc)):
-                raise
-            print(f"Instance types {resources['instance_types']} sold out; resubmitting without InstanceTypes "
-                  "(any type with the same cores/memory).", file=sys.stderr, flush=True)
-            config = copy.deepcopy(config)
-            del config["resources"]["instance_types"]
-            job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
-        bucket = config["umap"]["oss_bucket"]
-        summary = {"run_id": run_id, "job_id": job_id, "image": config["image"],
-                   "instance_types": config["resources"].get("instance_types") or "any",
-                   "dataset": f"oss://{bucket}/{config['umap']['source_zarr_path']}/",
-                   "results": f"oss://{bucket}/{results_prefix(config, run_id)}/",
-                   "oss_prefix": f"oss://{bucket}/{run_prefix(config, run_id)}/"}
-        out = ROOT / "work" / run_id
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "submission.json").write_text(json.dumps(summary, indent=2) + "\n")
-        print(json.dumps(summary, indent=2), flush=True)
-        stage = "GetJob"
-        return wait_for_job(client, job_id, args.wait_timeout, args.poll_seconds) if args.wait else 0
-    except (ValueError, OSError, ImportError) as exc:
-        # No request payload: it contains credentials.
-        print(f"Configuration error ({type(exc).__name__}); check config, dependencies and credentials.", file=sys.stderr)
-        if isinstance(exc, (ValueError, ImportError)) and not isinstance(exc, json.JSONDecodeError):
-            print(str(exc), file=sys.stderr)
-        return 1
+        return submit_and_wait(config, run_id, args)[0]
     except Exception as exc:
-        # Server error code/message help diagnose RAM, quota and network setup; never print the request.
-        exc = getattr(exc, "inner_exception", None) or exc  # SDK wraps credential/network errors
-        code, message = getattr(exc, "code", None), getattr(exc, "message", None)
-        if type(exc).__name__ == "CredentialException":  # lists why each local credential source failed
-            code = code or "LocalCredentials"
-        # SDK messages can echo request parameters, including registry credentials.
-        detail = f": {code}" if code else ""
-        print(f"{stage} failed ({type(exc).__name__}{detail})", file=sys.stderr)
-        if stage == "CreateJob":
-            print("The job may still have been created; check the INSTANT console before resubmitting.", file=sys.stderr)
-        return 1
+        return report_error(stage, exc)
 
 
 if __name__ == "__main__":

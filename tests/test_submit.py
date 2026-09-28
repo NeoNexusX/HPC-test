@@ -60,6 +60,14 @@ class SubmitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             submit.validate_config(c)
 
+    def test_config_accepts_optional_benchmark_labels(self):
+        c = config()
+        c["umap"]["benchmark_labels"] = {"instance_type": "ecs.c7.large", "cores": 2, "batch_id": "b1"}
+        submit.validate_config(c)
+        c["umap"]["benchmark_labels"] = {"bad key": "x"}
+        with self.assertRaises(ValueError):
+            submit.validate_config(c)
+
     def test_dataset_override_accepts_console_forms(self):
         for dataset in ["other/set.zarr", "other/set.zarr/", "oss://test-bucket/other/set.zarr/"]:
             c = config()

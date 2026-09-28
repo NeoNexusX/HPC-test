@@ -35,12 +35,26 @@ ZARR_METADATA_FILES = frozenset({"zarr.json", ".zarray", ".zattrs", ".zgroup", "
 SETTINGS_FIELDS = {"oss_bucket", "oss_region", "oss_endpoint", "oss_prefix", "source_zarr_path",
                    "write_back", "work_dir", "skip_ion_image_chunks", "full_matrix_mib",
                    "sample_matrix_mib", "max_fit_samples"}
+# Optional, echoed verbatim into result.json so a benchmark file records which planned
+# configuration (instance type, cores, disk, batch, repeat) produced it. The container never
+# acts on these values; the batch runner fills them in.
+OPTIONAL_SETTINGS_FIELDS = {"benchmark_labels"}
 
 
 def validate_settings(settings: dict, runtime: bool = False) -> None:
-    fields = SETTINGS_FIELDS | ({"run_id"} if runtime else set())
-    if set(settings) != fields:
+    required = SETTINGS_FIELDS | ({"run_id"} if runtime else set())
+    extra = set(settings) - required
+    if (required - set(settings)) or (extra - OPTIONAL_SETTINGS_FIELDS):
         raise ValueError("umap fields must match instant.example.json exactly")
+    labels = settings.get("benchmark_labels")
+    if labels is not None:
+        if not isinstance(labels, dict) or len(labels) > 20:
+            raise ValueError("benchmark_labels must be a small mapping")
+        for key, value in labels.items():
+            if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key)
+                    or isinstance(value, bool) or not isinstance(value, (str, int, float))
+                    or (isinstance(value, str) and (len(value) > 256 or any(c in value for c in "\n\r")))):
+                raise ValueError("benchmark_labels keys/values must be short strings or numbers")
     for key in ("oss_bucket", "oss_region", "oss_prefix", "source_zarr_path", "work_dir"):
         value = settings[key]
         if not isinstance(value, str) or not value or any(c in value for c in "<>\n\r"):

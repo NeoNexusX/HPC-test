@@ -1,0 +1,15 @@
+{
+  "batch_name": "umap-benchmark",
+  "runs": [
+    {
+      "config": "config/instant.local.json",
+      "instance_types": ["ecs.c7.large", "ecs.g7.large"],
+      "repeat": 3
+    },
+    {
+      "config": "config/instant.big.json",
+      "repeat": 2,
+      "dataset": "ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr"
+    }
+  ]
+}

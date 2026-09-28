@@ -57,6 +57,33 @@ def peak_rss_mib() -> float:
     return rss / 2**20 if sys.platform == "darwin" else rss / 1024  # bytes on macOS, KiB on Linux
 
 
+def _rate(mib: float, seconds) -> float | None:
+    """MiB/s, or None when the stage is too fast to measure (avoids dividing by zero)."""
+    return round(mib / seconds, 2) if isinstance(seconds, (int, float)) and seconds > 0 else None
+
+
+def throughput(stages_seconds: dict, download_bytes: int, uploaded_bytes: int, umap: dict) -> dict:
+    """Time and speed of each data-moving stage, recorded on the node that ran the job."""
+    download_mib, upload_mib = download_bytes / 2**20, uploaded_bytes / 2**20
+    dl, um, ul = stages_seconds.get("download"), stages_seconds.get("umap"), stages_seconds.get("upload")
+    return {
+        "download": {"seconds": dl, "mib": round(download_mib, 2), "mib_per_s": _rate(download_mib, dl)},
+        "compute": {"seconds": um, "matrix_mib": umap["matrix_mib"], "pixels": umap["pixels"],
+                    "mib_per_s": _rate(umap["matrix_mib"], um),
+                    "pixels_per_s": round(umap["pixels"] / um, 1) if isinstance(um, (int, float)) and um > 0 else None},
+        "upload": {"seconds": ul, "mib": round(upload_mib, 2), "mib_per_s": _rate(upload_mib, ul)},
+    }
+
+
+def throughput_lines(metrics: dict) -> list[str]:
+    return [f"throughput download={metrics['download']['mib']}MiB in {metrics['download']['seconds']}s "
+            f"({metrics['download']['mib_per_s']}MiB/s)",
+            f"throughput compute={metrics['compute']['matrix_mib']}MiB in {metrics['compute']['seconds']}s "
+            f"({metrics['compute']['mib_per_s']}MiB/s, {metrics['compute']['pixels_per_s']}px/s)",
+            f"throughput upload={metrics['upload']['mib']}MiB in {metrics['upload']['seconds']}s "
+            f"({metrics['upload']['mib_per_s']}MiB/s)"]
+
+
 def run(settings: dict, bucket, output: Path, work: Path) -> int:
     output.mkdir(parents=True, exist_ok=True)
     attempt = uuid.uuid4().hex[:12]
@@ -85,6 +112,7 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
               "image_git_sha": os.getenv("IMAGE_GIT_SHA"), "packages": package_versions(),
               "job_id": os.getenv("EHPC_JOB_ID"), "executor_id": os.getenv("EHPC_EXECUTOR_ID"),
               "hostname": socket.gethostname(), "settings": settings,
+              "benchmark_labels": settings.get("benchmark_labels"),
               "source": f"{bucket_url}/{source}/", "results": f"{bucket_url}/{results_prefix}/",
               "stages_seconds": {}, "umap_pass": False}
     log(f"start run={settings['run_id']} attempt={attempt} host={result['hostname']} "
@@ -96,6 +124,11 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
             log(line)
     except Exception as exc:  # inventory is informational and must not fail the analysis
         result["cpu"] = {"pass": False, "error": error_name(exc)}
+    # Disk config of the machine that ran, so a benchmark file records the storage it measured on.
+    usage = shutil.disk_usage(work)
+    result["disk"] = {"work_dir": str(work), "total_gib": round(usage.total / 2**30, 2),
+                      "used_gib": round(usage.used / 2**30, 2), "free_gib": round(usage.free / 2**30, 2)}
+    log(f"disk work_dir={work} total={result['disk']['total_gib']}GiB free={result['disk']['free_gib']}GiB")
 
     try:
         objects = stage("list", lambda: list_source_objects(bucket, source))
@@ -119,7 +152,15 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
         changed = diff_snapshot(before, snapshot_dir(local_source))
         result["result_files"] = changed
         log(f"upload {len(changed)} new zarr files -> {result['results']}")
-        stage("upload", lambda: upload_files(bucket, local_source, changed, results_prefix))
+        uploaded_bytes = stage("upload", lambda: upload_files(bucket, local_source, changed, results_prefix))
+        result["dataset"]["uploaded_bytes"] = uploaded_bytes
+        result["throughput"] = throughput(result["stages_seconds"], download_bytes, uploaded_bytes, umap)
+        for line in throughput_lines(result["throughput"]):
+            log(line)
+        # Upload succeeded, so the local Zarr copy (downloaded dataset + UMAP output) is redundant;
+        # remove it to free disk. Deliberately outside stage() so cleanup is not counted in the timings.
+        shutil.rmtree(local_source, ignore_errors=True)
+        log(f"cleaned local dataset copy {local_source} after successful upload")
         result["umap_pass"] = True
     except Exception as exc:
         result["error"] = error_detail(exc)

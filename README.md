@@ -224,6 +224,35 @@ python scripts/submit_instant.py --dataset oss://official-oss/ehpc-benchmark/tes
 python scripts/submit_instant.py --config config/instant.local.json --job-id job-xxxxxxxx --wait-timeout 1800
 ```
 
+### 批量测试（多配置、每个型号跑多遍，自动依次执行）
+
+用一个批次文件一次指定多个配置，每个配置可列多个实例型号、每个型号跑若干遍。脚本会把它们展开成 `配置 × 型号 × 遍数` 的矩阵，**逐个提交、跑完一个再跑下一个**（`submit_and_wait` 内部 `--wait`），中途某个作业失败也会记录后继续跑完剩下的。
+
+```bash
+cp config/batch.example.json config/batch.local.json   # 已被 .gitignore 排除
+# 预览：只校验并打印计划（每个作业的 run_id、型号、OSS 目标），不调用任何 API
+python scripts/run_batch.py --batch config/batch.local.json --dry-run
+# 正式跑：依次提交并等待
+python scripts/run_batch.py --batch config/batch.local.json --wait-timeout 1800
+```
+
+`config/batch.local.json`（`runs` 里每一项）：
+
+| 字段 | 说明 |
+|---|---|
+| `config` | 该组作业用的配置文件路径（相对仓库根目录或绝对路径），与单发用的 `instant.local.json` 同格式 |
+| `instance_types`（可选） | 要逐个测试的实例型号列表，例如 `["ecs.c7.large", "ecs.g7.large"]`。每个型号会被单独钉住成一个作业（`resources.instance_types=[该型号]`），结果里能明确记录跑的是哪个型号。不写则回退到 `config` 里的 `resources.instance_types`；再没有就交给 INSTANT 自选（记为 `any`） |
+| `repeat`（可选） | 每个型号跑几遍，默认 1，上限 100 |
+| `dataset`（可选） | 临时覆盖该组的数据集，等同单发的 `--dataset` |
+
+**一次批量 = 一个 OSS 文件夹。** 每次运行 `run_batch.py` 会生成一个 `batch_id`，本次所有作业的结果都归到同一个批次文件夹下：
+
+```text
+oss://<bucket>/<oss_prefix>/<batch_id>/<run_id>/<attempt-id>/{result.json, run.log, umap_image.jpg, manifest.json, ...}
+```
+
+本地会在 `work/<batch_id>/batch_summary.json` 汇总本次每个作业的 `run_id`、型号、遍数、退出码、`job_id` 和结果地址。批次退出码：全部成功为 `0`，有任何作业失败为 `1`。
+
 提交成功后会打印 `run_id`、`job_id`、实际请求的实例规格（`instance_types`，回退后为 `any`）、数据集地址、结果地址和 OSS 归档前缀，并保存到本地 `work/<run-id>/submission.json`。作业失败时还会打印 INSTANT 给出的失败原因（`StatusReason`）。
 
 本地退出码：
@@ -243,10 +272,11 @@ python scripts/submit_instant.py --config config/instant.local.json --job-id job
 
 ## 三、结果
 
+单发（`submit_instant.py`）的结果放在 `oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/`；批量（`run_batch.py`）的每个作业放在 `oss://<bucket>/<oss_prefix>/<batch_id>/<run-id>/<attempt-id>/`。每个目录内容相同：
+
 ```text
-oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/
   run.log            可读的逐行日志（见下）；失败时包含错误和 Python 调用栈
-  result.json        全部数据：CPU 信息、数据集统计、各阶段耗时、抽样参数、峰值内存、结果文件列表
+  result.json        全部数据：CPU 信息、磁盘配置、数据集统计、各阶段耗时与速度、抽样参数、峰值内存、结果文件列表；批量运行时还含 benchmark_labels（型号/核数/内存/磁盘/批次/第几遍）
   umap_image.jpg     UMAP 前三维映射成 RGB 的空间图像
   massflow.log       MassFlow 自身的日志
   zarr-delta/        UMAP 新增到 Zarr 的文件（write_back=false 时），与源 Zarr 叠加即得到完整结果：
@@ -264,13 +294,20 @@ oss://<bucket>/<oss_prefix>/<run-id>/<attempt-id>/
 ... start run=<run-id> attempt=<attempt-id> host=... image_git_sha=...
 ... packages massflow=0.1.2 umap-learn=... pynndescent=... numba=... numpy=... scikit-learn=... zarr=...
 ... cpu model: <型号> (<厂商>, x86_64)
+... disk work_dir=/tmp/umap-work total=100.0GiB free=98.7GiB
 ... dataset oss://official-oss/ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr/ objects=239 size=50.3MiB download=29.9MiB skipped_ion_image_chunks=70
 ... finish download ...s
 ... finish umap 10.1s
 ... umap pixels=20346 features=836 matrix=64.9MiB fit_samples=20346 sample_ratio=1.000000
 ... upload 6 new zarr files -> oss://official-oss/ehpc-benchmark/<run-id>/<attempt-id>/zarr-delta/
+... throughput download=29.9MiB in ...s (...MiB/s)
+... throughput compute=64.9MiB in 10.1s (...MiB/s, ...px/s)
+... throughput upload=...MiB in ...s (...MiB/s)
+... cleaned local dataset copy /tmp/umap-work/<数据集>.zarr after successful upload
 ... umap_pass=True peak_rss=974.9MiB stages_seconds={'list': ..., 'download': ..., 'import': ..., 'umap': ..., 'upload': ...}
 ```
+
+`result.json` 里对应的 `throughput` 记录了三个数据阶段的**时间和速度**：`download`（下载 MiB 与 MiB/s）、`compute`（UMAP 处理的矩阵 MiB、像素数，以及 MiB/s、px/s）、`upload`（上传 MiB 与 MiB/s）；`disk` 记录了本次作业所在机器的磁盘配置。上传成功后会立即删除本地下载/计算产生的副本以释放磁盘，这步在计时之外，不计入 `stages_seconds`。
 
 以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。
 
