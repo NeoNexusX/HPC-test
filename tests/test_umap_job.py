@@ -1,10 +1,12 @@
 """UMAP pipeline tests. The image job runs this file with MassFlow installed (REQUIRE_MASSFLOW=1)."""
 from __future__ import annotations
 import importlib.util
+import datetime as dt
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -43,8 +45,17 @@ def fake_umap(settings, local_source, image_path):
 
 
 class UmapJobTests(unittest.TestCase):
+    def test_bucket_pool_matches_download_workers(self):
+        env = {"OSS_ACCESS_KEY_ID": "test-id", "OSS_ACCESS_KEY_SECRET": "test-secret",
+               "OSS_TOKEN_0": "test-token",
+               "OSS_STS_EXPIRATION": (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()}
+        with patch.dict(os.environ, env, clear=True):
+            bucket = runner.make_bucket(dict(config()["umap"], download_workers=48))
+        self.assertEqual(bucket.session.session.adapters["https://"]._pool_maxsize, 48)
+
     def test_skips_only_ion_image_chunks(self):
-        objects = umap_job.list_source_objects(Bucket(dataset()), SOURCE)
+        objects, excluded = umap_job.list_source_objects(Bucket(dataset()), SOURCE)
+        self.assertFalse(excluded)
         kept, skipped = umap_job.split_download_objects(objects, SOURCE, True)
         self.assertEqual([o["key"] for o in skipped], [f"{SOURCE}/ion_image/intensity/c/0"])
         self.assertEqual(len(kept), len(objects) - 1)
@@ -58,12 +69,56 @@ class UmapJobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             umap_job.list_source_objects(Bucket({f"{SOURCE}/a//b": b"x"}), SOURCE)
         # Directory placeholders from console uploads are ignored.
-        objects = umap_job.list_source_objects(Bucket(dict(dataset(), **{f"{SOURCE}/axes/": b""})), SOURCE)
+        objects, _ = umap_job.list_source_objects(Bucket(dict(dataset(), **{f"{SOURCE}/axes/": b""})), SOURCE)
         self.assertEqual(len(objects), len(dataset()))
+
+    def test_listing_excludes_chunk_prefix_without_enumerating_it(self):
+        bucket = Bucket(dataset())
+        objects, excluded = umap_job.list_source_objects(bucket, SOURCE, True)
+        self.assertTrue(excluded)
+        self.assertNotIn(f"{SOURCE}/ion_image/intensity/c/0", {obj["key"] for obj in objects})
+        self.assertIn(f"{SOURCE}/ion_image/intensity/zarr.json", {obj["key"] for obj in objects})
+        self.assertFalse(any(prefix.startswith(f"{SOURCE}/ion_image/intensity/c/")
+                             for prefix, _ in bucket.lists))
+        self.assertFalse(any(prefix == f"{SOURCE}/ion_image/intensity/" and not delimiter
+                             for prefix, delimiter in bucket.lists))
+        no_spectra = Bucket({key: value for key, value in dataset().items() if "/spectra/" not in key})
+        fallback, excluded = umap_job.list_source_objects(no_spectra, SOURCE, True)
+        self.assertFalse(excluded)
+        self.assertIn(f"{SOURCE}/ion_image/intensity/c/0", {obj["key"] for obj in fallback})
+
+    def test_array_listing_runs_concurrently(self):
+        axes_started = threading.Event()
+        spectra_started = threading.Event()
+
+        class GatedBucket(Bucket):
+            def list_objects_v2(self, prefix="", **kwargs):
+                if prefix == f"{SOURCE}/axes/mz/":
+                    axes_started.set()
+                    if not spectra_started.wait(2):
+                        raise AssertionError("spectra listing did not run alongside axes")
+                elif prefix == f"{SOURCE}/spectra/intensity/":
+                    spectra_started.set()
+                    if not axes_started.wait(2):
+                        raise AssertionError("axes listing did not run alongside spectra")
+                return super().list_objects_v2(prefix=prefix, **kwargs)
+
+        objects, _ = umap_job.list_source_objects(GatedBucket(dataset()), SOURCE)
+        self.assertEqual(len(objects), len(dataset()))
+
+    def test_large_spectra_chunk_listing_preserves_every_key(self):
+        values = dict(dataset())
+        values.update({f"{SOURCE}/spectra/intensity/c/{i}": b"x" for i in range(1200)})
+        values.update({f"{SOURCE}/spectra/intensity/c/{name}": b"x"
+                       for name in ("!extra", ":", "zextra")})
+        values[f"{SOURCE}/spectra/intensity/c/"] = b""  # directory placeholder
+        objects, _ = umap_job.list_source_objects(Bucket(values), SOURCE)
+        self.assertEqual({obj["key"] for obj in objects}, {key for key in values if not key.endswith("/")})
+        self.assertEqual(len(objects), len(values) - 1)
 
     def test_download_checks_etag_and_leaves_no_partial_files(self):
         bucket = Bucket(dataset())
-        objects = umap_job.list_source_objects(bucket, SOURCE)
+        objects, _ = umap_job.list_source_objects(bucket, SOURCE)
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "sample.zarr"
             self.assertEqual(umap_job.download_objects(bucket, objects, SOURCE, target),
@@ -77,6 +132,42 @@ class UmapJobTests(unittest.TestCase):
                 umap_job.download_objects(bucket, objects, SOURCE, target)
             self.assertFalse((target / "axes/mz/c/0").exists())
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["sample.zarr"])
+
+    def test_download_continues_as_workers_free_and_stops_on_first_failure(self):
+        first_started = threading.Event()
+        third_started = threading.Event()
+
+        class SlowBucket(Bucket):
+            def get_object_to_file(self, key, filename, headers=None, **kwargs):
+                if key.endswith("/0"):
+                    first_started.set()
+                    if not third_started.wait(2):
+                        raise AssertionError("third transfer waited for the first transfer")
+                if key.endswith("/2"):
+                    third_started.set()
+                return super().get_object_to_file(key, filename, headers=headers, **kwargs)
+
+        values = {f"{SOURCE}/c/{i}": bytes([i]) for i in range(3)}
+        bucket = SlowBucket(values)
+        objects, _ = umap_job.list_source_objects(bucket, SOURCE)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(umap_job.download_objects(bucket, objects, SOURCE,
+                                                       Path(directory) / "data.zarr", workers=2), 3)
+        self.assertTrue(first_started.is_set())
+        self.assertTrue(third_started.is_set())
+
+        class FailingBucket(Bucket):
+            def get_object_to_file(self, key, filename, headers=None, **kwargs):
+                if key.endswith("/0"):
+                    raise IOError("first object failed")
+                return super().get_object_to_file(key, filename, headers=headers, **kwargs)
+
+        values = {f"{SOURCE}/c/{i}": bytes([i]) for i in range(20)}
+        bucket = FailingBucket(values)
+        objects, _ = umap_job.list_source_objects(bucket, SOURCE)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(IOError, "first object failed"):
+            umap_job.download_objects(bucket, objects, SOURCE, Path(directory) / "data.zarr", workers=2)
+        self.assertLess(len(bucket.gets), len(objects))
 
     def test_sample_ratio_uses_full_matrix_or_budget(self):
         class Ms(list):
@@ -113,6 +204,10 @@ class UmapJobTests(unittest.TestCase):
                 umap_job.validate_settings(dict(base, benchmark_labels=bad), runtime=True)
         with self.assertRaises(ValueError):
             umap_job.validate_settings(dict(base, unknown="x"), runtime=True)
+        for workers in (0, 129, True, "32"):
+            with self.assertRaises(ValueError):
+                umap_job.validate_settings(dict(base, download_workers=workers), runtime=True)
+        umap_job.validate_settings(dict(base, download_workers=32), runtime=True)
 
     def test_throughput_reports_speed_and_guards_zero_seconds(self):
         metrics = runner.throughput({"download": 2.0, "umap": 4.0, "upload": 0},
@@ -121,6 +216,15 @@ class UmapJobTests(unittest.TestCase):
         self.assertEqual(metrics["compute"]["mib_per_s"], 2.0)
         self.assertEqual(metrics["compute"]["pixels_per_s"], 25.0)
         self.assertIsNone(metrics["upload"]["mib_per_s"])  # a zero-second stage cannot report a rate
+
+    def test_timing_summary_accounts_for_import_download_overlap(self):
+        timings = runner.timing_summary(
+            {"list": 1.0, "import": 12.0, "download": 4.0},
+            {"import": (5.0, 17.0), "download": (7.0, 11.0)},
+            pipeline_start=0.0, pipeline_end=20.0, data_ready=18.0)
+        self.assertEqual(timings, {"list_seconds": 1.0, "massflow_import_seconds": 12.0,
+                                   "download_seconds": 4.0, "import_download_overlap_seconds": 4.0,
+                                   "list_to_umap_seconds": 18.0, "pipeline_seconds": 20.0})
 
     def test_lscpu_summary_handles_nested_and_flat_output(self):
         nested = {"lscpu": [
@@ -165,8 +269,16 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("umap pixels=120 features=40", files["run.log"])
         self.assertIn("cpu model: Test CPU", files["run.log"])
         result = json.loads(files["result.json"])
-        self.assertEqual(result["dataset"]["skipped_ion_image_chunks"], 1)
+        self.assertIsNone(result["dataset"]["skipped_ion_image_chunks"])
+        self.assertFalse(result["dataset"]["total_objects_known"])
+        self.assertEqual(result["dataset"]["listing_excluded_prefixes"],
+                         [f"{SOURCE}/ion_image/intensity/"])
         self.assertEqual(set(result["stages_seconds"]), {"list", "download", "import", "umap", "upload"})
+        self.assertEqual(result["timings"]["list_seconds"], result["stages_seconds"]["list"])
+        self.assertEqual(result["timings"]["massflow_import_seconds"], result["stages_seconds"]["import"])
+        self.assertEqual(result["timings"]["download_seconds"], result["stages_seconds"]["download"])
+        self.assertIn("timings list_seconds=", files["run.log"])
+        self.assertEqual(result["dataset"]["downloaded_bytes"], result["dataset"]["planned_download_bytes"])
         # Node metrics: time and speed of each data-moving stage, plus the disk the job ran on.
         self.assertEqual(set(result["throughput"]), {"download", "compute", "upload"})
         self.assertEqual(result["throughput"]["compute"]["pixels"], 120)
@@ -174,6 +286,21 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("uploaded_bytes", result["dataset"])
         self.assertIn("throughput download", files["run.log"])
         self.assertIn("disk work_dir", files["run.log"])
+
+    @patch.object(runner, "run_umap", side_effect=fake_umap)
+    def test_import_starts_while_download_is_running(self, *_):
+        import_started = threading.Event()
+
+        class GatedBucket(Bucket):
+            def get_object_to_file(self, key, filename, headers=None, **kwargs):
+                if not import_started.wait(2):
+                    raise AssertionError("download began before the import task")
+                return super().get_object_to_file(key, filename, headers=headers, **kwargs)
+
+        with patch.object(runner, "import_massflow", side_effect=import_started.set):
+            code, files = self.run_job(GatedBucket(dataset()))
+        self.assertEqual(code, 0, files["run.log"])
+        self.assertTrue(import_started.is_set())
 
     @patch.object(runner, "run_umap", side_effect=fake_umap)
     def test_local_copy_is_cleaned_after_successful_upload(self, *_):

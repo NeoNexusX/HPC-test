@@ -140,6 +140,20 @@ class SubmitTests(unittest.TestCase):
             if fallback:
                 self.assertNotIn("InstanceTypes", resources[1])
 
+    def test_sold_out_fallback_relabels_batch_results(self):
+        c = config()
+        c["resources"].update(instance_types=["ecs.c7.large"], fallback_any_type=True)
+        c["umap"]["benchmark_labels"] = {"batch_id": "b-1", "instance_type": "ecs.c7.large", "cores": 2}
+        client = Mock()
+        client.create_job.side_effect = [ApiError("RecommendEmpty.InstanceTypeSoldOut"),
+                                          Mock(**{"body.job_id": "job-2"})]
+        self.assertEqual(self.submit_main(c, client), 0)
+        container = client.create_job.call_args.args[0].to_map()["Tasks"][0]["TaskSpec"]["TaskExecutor"][0]["Container"]
+        labels = json.loads("".join(container["Arg"][1:]))["benchmark_labels"]
+        # result.json must not claim the sold-out type ran the job
+        self.assertEqual(labels, {"batch_id": "b-1", "instance_type": "any", "cores": 2,
+                                  "sold_out_instance_types": "ecs.c7.large"})
+
     def test_other_create_job_errors_are_not_retried(self):
         c = config()
         c["resources"].update(instance_types=["ecs.c7nex.large"], fallback_any_type=True)

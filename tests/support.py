@@ -42,16 +42,30 @@ class Bucket:
         self.objects = dict(objects or {})
         self.fail = fail
         self.gets = []
+        self.lists = []
 
-    def list_objects_v2(self, prefix="", continuation_token="", max_keys=100, **_):
+    def list_objects_v2(self, prefix="", delimiter="", continuation_token="", start_after="", max_keys=100, **_):
+        self.lists.append((prefix, delimiter))
         keys = sorted(key for key in self.objects if key.startswith(prefix))
+        if delimiter:
+            direct, folders = set(), set()
+            for key in keys:
+                suffix = key[len(prefix):]
+                child, separator, _ = suffix.partition(delimiter)
+                (folders if separator else direct).add(prefix + child + delimiter if separator else key)
+            entries = sorted([(key, False) for key in direct] + [(key, True) for key in folders])
+        else:
+            entries = [(key, False) for key in keys]
+        if start_after:
+            entries = [(key, is_prefix) for key, is_prefix in entries if key > start_after]
         start = int(continuation_token or 0)
         end = start + max_keys
         # The listing API quotes ETags; GetObject results do not.
         return SimpleNamespace(
             object_list=[SimpleNamespace(key=key, size=len(self.objects[key]), etag=f'"{etag(self.objects[key])}"')
-                         for key in keys[start:end]],
-            prefix_list=[], is_truncated=end < len(keys), next_continuation_token=str(end))
+                         for key, is_prefix in entries[start:end] if not is_prefix],
+            prefix_list=[key for key, is_prefix in entries[start:end] if is_prefix],
+            is_truncated=end < len(entries), next_continuation_token=str(end))
 
     def get_object_to_file(self, key, filename, headers=None, **_):
         self.gets.append(key)

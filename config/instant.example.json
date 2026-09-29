@@ -20,6 +20,7 @@
     "write_back": false,
     "work_dir": "/tmp/umap-work",
     "skip_ion_image_chunks": true,
+    "download_workers": 32,
     "full_matrix_mib": 1024,
     "sample_matrix_mib": 1024,
     "max_fit_samples": 20000

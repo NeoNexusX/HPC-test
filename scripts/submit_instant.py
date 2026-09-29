@@ -33,10 +33,23 @@ def load_env_file(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = (part.strip() for part in line.removeprefix("export ").split("=", 1))
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
+        value = parse_env_value(value)
         if value:  # an empty placeholder must not mask other credential sources
             os.environ.setdefault(key, value)
+
+
+def parse_env_value(value: str) -> str:
+    """Read simple .env values and JSON-quoted values written by the local UI."""
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, str):
+                return decoded
+        except json.JSONDecodeError:
+            pass  # Preserve legacy quoted values that are not JSON strings.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
 
 
 def validate_config(config: dict) -> None:
@@ -321,10 +334,15 @@ def submit_and_wait(config: dict, run_id: str, args, *, client=None, sts_client=
             print(f"Instance types {resources['instance_types']} sold out; resubmitting without InstanceTypes "
                   "(any type with the same cores/memory).", file=sys.stderr, flush=True)
             config = copy.deepcopy(config)
-            del config["resources"]["instance_types"]
+            sold = config["resources"].pop("instance_types")
+            labels = config["umap"].get("benchmark_labels") or {}
+            if "instance_type" in labels:  # set by run_batch: result.json must not name the sold-out type
+                labels["instance_type"] = "any"
+                if len(labels) < 20:
+                    labels["sold_out_instance_types"] = ",".join(sold)
             job_id = create_job(client, config, run_id, credentials, args.wait_timeout)
         bucket = config["umap"]["oss_bucket"]
-        summary = {"run_id": run_id, "job_id": job_id, "image": config["image"],
+        summary = {"run_id": run_id, "job_id": job_id, "region": config["region"], "image": config["image"],
                    "instance_types": config["resources"].get("instance_types") or "any",
                    "dataset": f"oss://{bucket}/{config['umap']['source_zarr_path']}/",
                    "results": f"oss://{bucket}/{results_prefix(config, run_id)}/",
@@ -352,6 +370,7 @@ def main() -> int:
     parser.add_argument("--job-id", help="wait for an existing job; never resubmit")
     parser.add_argument("--wait-timeout", type=int, default=1800)
     parser.add_argument("--poll-seconds", type=int, default=10)
+    parser.add_argument("--run-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
     stage = "setup"
     try:
@@ -359,6 +378,10 @@ def main() -> int:
             raise ValueError("timeouts must be positive")
         if args.job_id and args.dry_run:
             raise ValueError("--job-id cannot be combined with --dry-run")
+        if args.run_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.run_id):
+            raise ValueError("invalid run id")
+        if args.job_id and args.run_id:
+            raise ValueError("--run-id cannot be combined with --job-id")
         load_env_file(Path(args.env_file))
         config = json.loads(Path(args.config).read_text())
         if isinstance(config.get("umap"), dict):
@@ -367,7 +390,7 @@ def main() -> int:
         if args.job_id:
             stage = "GetJob"
             return wait_for_job(make_client(config["region"]), args.job_id, args.wait_timeout, args.poll_seconds)
-        run_id = new_run_id()
+        run_id = args.run_id or new_run_id()
         if args.dry_run:
             request = build_request(config, run_id, registry_env={})
             sdk_model(request)

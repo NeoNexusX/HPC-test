@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 from importlib import metadata
 import json
@@ -19,7 +20,8 @@ import uuid
 
 from umap_job import (check_disk_space, cpu_inventory, cpu_lines, diff_snapshot, download_objects, error_detail,
                       error_name, import_massflow, list_source_objects, run_umap, snapshot_dir,
-                      split_download_objects, upload_files, validate_settings)
+                      split_download_objects, upload_files, validate_settings, DEFAULT_DOWNLOAD_WORKERS,
+                      LIST_WORKERS)
 
 
 def make_bucket(settings: dict):
@@ -37,8 +39,10 @@ def make_bucket(settings: dict):
     auth = oss2.StsAuth(os.environ["OSS_ACCESS_KEY_ID"], os.environ["OSS_ACCESS_KEY_SECRET"],
                         "".join(parts), auth_version="v4")
     # CRC64 stays on: this moves real data. The image compiles crcmod's C extension for speed.
+    workers = settings.get("download_workers", DEFAULT_DOWNLOAD_WORKERS)
+    session = oss2.http.Session(pool_size=max(workers, LIST_WORKERS))
     return oss2.Bucket(auth, settings["oss_endpoint"], settings["oss_bucket"],
-                       region=settings["oss_region"], connect_timeout=60)
+                       region=settings["oss_region"], connect_timeout=60, session=session)
 
 
 def package_versions() -> dict:
@@ -84,6 +88,22 @@ def throughput_lines(metrics: dict) -> list[str]:
             f"({metrics['upload']['mib_per_s']}MiB/s)"]
 
 
+def timing_summary(stages: dict, intervals: dict, pipeline_start: float,
+                   pipeline_end: float, data_ready: float | None) -> dict:
+    """Wall-clock timings; import and download are measured independently while they overlap."""
+    overlap = None
+    if "import" in intervals and "download" in intervals:
+        import_start, import_end = intervals["import"]
+        download_start, download_end = intervals["download"]
+        overlap = round(max(0.0, min(import_end, download_end) - max(import_start, download_start)), 3)
+    return {"list_seconds": stages.get("list"),
+            "massflow_import_seconds": stages.get("import"),
+            "download_seconds": stages.get("download"),
+            "import_download_overlap_seconds": overlap,
+            "list_to_umap_seconds": round(data_ready - pipeline_start, 3) if data_ready is not None else None,
+            "pipeline_seconds": round(pipeline_end - pipeline_start, 3)}
+
+
 def run(settings: dict, bucket, output: Path, work: Path) -> int:
     output.mkdir(parents=True, exist_ok=True)
     attempt = uuid.uuid4().hex[:12]
@@ -92,6 +112,7 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
     # Test runs keep the dataset read-only; write_back stores analysis/umap in the source like FC did.
     results_prefix = source if settings["write_back"] else f"{prefix}/zarr-delta"
     log_path = output / "run.log"
+    stage_intervals = {}
 
     def log(message):
         line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}"
@@ -102,10 +123,16 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
     def stage(name, operation):
         log(f"start {name}")
         start = time.perf_counter()
-        value = operation()
-        result["stages_seconds"][name] = round(time.perf_counter() - start, 3)
-        log(f"finish {name} {result['stages_seconds'][name]:.1f}s")
-        return value
+        succeeded = False
+        try:
+            value = operation()
+            succeeded = True
+            return value
+        finally:
+            end = time.perf_counter()
+            stage_intervals[name] = (start, end)
+            result["stages_seconds"][name] = round(end - start, 3)
+            log(f"{'finish' if succeeded else 'failed'} {name} {result['stages_seconds'][name]:.3f}s")
 
     bucket_url = f"oss://{settings['oss_bucket']}"
     result = {"run_id": settings["run_id"], "attempt_id": attempt,
@@ -130,21 +157,37 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
                       "used_gib": round(usage.used / 2**30, 2), "free_gib": round(usage.free / 2**30, 2)}
     log(f"disk work_dir={work} total={result['disk']['total_gib']}GiB free={result['disk']['free_gib']}GiB")
 
+    pipeline_start = time.perf_counter()
+    pipeline_end = None
+    data_ready = None
     try:
-        objects = stage("list", lambda: list_source_objects(bucket, source))
+        objects, excluded = stage("list", lambda: list_source_objects(
+            bucket, source, settings["skip_ion_image_chunks"]))
         download, skipped = split_download_objects(objects, source, settings["skip_ion_image_chunks"])
         download_bytes = sum(obj["size"] for obj in download)
         result["dataset"] = {"objects": len(objects), "bytes": sum(obj["size"] for obj in objects),
-                             "downloaded_objects": len(download), "downloaded_bytes": download_bytes,
-                             "skipped_ion_image_chunks": len(skipped)}
-        log(f"dataset {result['source']} objects={len(objects)} "
-            f"size={result['dataset']['bytes'] / 2**20:.1f}MiB download={download_bytes / 2**20:.1f}MiB "
-            f"skipped_ion_image_chunks={len(skipped)}")
+                             "planned_download_objects": len(download), "planned_download_bytes": download_bytes,
+                             "downloaded_objects": None, "downloaded_bytes": None,
+                             "skipped_ion_image_chunks": None if excluded else len(skipped),
+                             "listing_excluded_prefixes": [f"{source}/ion_image/intensity/"] if excluded else [],
+                             "total_objects_known": not excluded}
+        log(f"dataset {result['source']} listed_objects={len(objects)} "
+            f"listed_size={result['dataset']['bytes'] / 2**20:.1f}MiB "
+            f"download={download_bytes / 2**20:.1f}MiB "
+            f"excluded_ion_image_chunks={excluded}")
         local_source = work / Path(source).name
         check_disk_space(work, download_bytes)
-        stage("download", lambda: download_objects(bucket, download, source, local_source))
-        before = snapshot_dir(local_source)
-        stage("import", import_massflow)
+        workers = settings.get("download_workers", DEFAULT_DOWNLOAD_WORKERS)
+        log(f"download workers={workers}")
+        with ThreadPoolExecutor(max_workers=1) as importer:
+            imported = importer.submit(stage, "import", import_massflow)
+            actual_download_bytes = stage("download", lambda: download_objects(
+                bucket, download, source, local_source, workers))
+            result["dataset"]["downloaded_objects"] = len(download)
+            result["dataset"]["downloaded_bytes"] = actual_download_bytes
+            before = snapshot_dir(local_source)
+            imported.result()
+        data_ready = time.perf_counter()
         umap = stage("umap", lambda: run_umap(settings, local_source, output / "umap_image.jpg"))
         result["umap"] = umap
         log(f"umap pixels={umap['pixels']} features={umap['features']} matrix={umap['matrix_mib']:.1f}MiB "
@@ -153,8 +196,9 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
         result["result_files"] = changed
         log(f"upload {len(changed)} new zarr files -> {result['results']}")
         uploaded_bytes = stage("upload", lambda: upload_files(bucket, local_source, changed, results_prefix))
+        pipeline_end = time.perf_counter()
         result["dataset"]["uploaded_bytes"] = uploaded_bytes
-        result["throughput"] = throughput(result["stages_seconds"], download_bytes, uploaded_bytes, umap)
+        result["throughput"] = throughput(result["stages_seconds"], actual_download_bytes, uploaded_bytes, umap)
         for line in throughput_lines(result["throughput"]):
             log(line)
         # Upload succeeded, so the local Zarr copy (downloaded dataset + UMAP output) is redundant;
@@ -163,11 +207,17 @@ def run(settings: dict, bucket, output: Path, work: Path) -> int:
         log(f"cleaned local dataset copy {local_source} after successful upload")
         result["umap_pass"] = True
     except Exception as exc:
+        pipeline_end = pipeline_end or time.perf_counter()
         result["error"] = error_detail(exc)
         log(f"umap pipeline FAILED: {result['error']}")
         if result["error"] != error_name(exc):  # OSS errors are reduced to class and code only
             for line in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).splitlines():
                 log(f"  {line}")
+    result["timings"] = timing_summary(result["stages_seconds"], stage_intervals, pipeline_start,
+                                       pipeline_end or time.perf_counter(), data_ready)
+    timing = result["timings"]
+    log("timings " + " ".join(f"{name}={value:.3f}s" for name, value in timing.items()
+                            if isinstance(value, (int, float))))
     result["peak_rss_mib"] = round(peak_rss_mib(), 1)
     log(f"umap_pass={result['umap_pass']} peak_rss={result['peak_rss_mib']}MiB "
         f"stages_seconds={result['stages_seconds']}")

@@ -7,7 +7,7 @@ INSTANT job starts on a fresh machine whose system disk and run time are set per
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import errno
 import json
 import logging
@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 
 import oss2
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 TRANSFER_WORKERS = 8
 TRANSFER_BATCH = 64
+DEFAULT_DOWNLOAD_WORKERS = 32
+LIST_WORKERS = 16
 # Free space kept on the work disk beyond the download, for UMAP output and temporary files.
 DISK_RESERVE_MIB = 1024
 TRANSFORM_BATCH_SIZE = 1024
@@ -38,7 +41,7 @@ SETTINGS_FIELDS = {"oss_bucket", "oss_region", "oss_endpoint", "oss_prefix", "so
 # Optional, echoed verbatim into result.json so a benchmark file records which planned
 # configuration (instance type, cores, disk, batch, repeat) produced it. The container never
 # acts on these values; the batch runner fills them in.
-OPTIONAL_SETTINGS_FIELDS = {"benchmark_labels"}
+OPTIONAL_SETTINGS_FIELDS = {"benchmark_labels", "download_workers"}
 
 
 def validate_settings(settings: dict, runtime: bool = False) -> None:
@@ -47,6 +50,9 @@ def validate_settings(settings: dict, runtime: bool = False) -> None:
     if (required - set(settings)) or (extra - OPTIONAL_SETTINGS_FIELDS):
         raise ValueError("umap fields must match instant.example.json exactly")
     labels = settings.get("benchmark_labels")
+    workers = settings.get("download_workers", DEFAULT_DOWNLOAD_WORKERS)
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 128:
+        raise ValueError("download_workers must be an integer from 1 to 128")
     if labels is not None:
         if not isinstance(labels, dict) or len(labels) > 20:
             raise ValueError("benchmark_labels must be a small mapping")
@@ -161,19 +167,116 @@ def error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"[:500]
 
 
-def list_source_objects(bucket, source: str) -> list[dict]:
-    """List every object under the Zarr prefix and check that each maps to a local file."""
-    objects = []
-    for obj in oss2.ObjectIteratorV2(bucket, prefix=f"{source}/", max_keys=1000):
-        if obj.key.endswith("/"):  # directory placeholder created by some upload tools
-            continue
-        rel = obj.key[len(source) + 1:]
-        if any(part in {"", ".", ".."} for part in rel.split("/")) or "\\" in rel or "\x00" in rel:
-            raise ValueError(f"object key cannot be mapped to a local file: {obj.key!r}")
-        objects.append({"key": obj.key, "size": obj.size, "etag": obj.etag.strip('"')})
+def _object_record(obj, source: str) -> dict | None:
+    if obj.key.endswith("/"):  # directory placeholder created by some upload tools
+        return None
+    rel = obj.key[len(source) + 1:]
+    if any(part in {"", ".", ".."} for part in rel.split("/")) or "\\" in rel or "\x00" in rel:
+        raise ValueError(f"object key cannot be mapped to a local file: {obj.key!r}")
+    return {"key": obj.key, "size": obj.size, "etag": obj.etag.strip('"')}
+
+
+def _list_prefix(bucket, source: str, prefix: str, delimiter: str = "") -> tuple[list[dict], list[str]]:
+    objects, prefixes = [], []
+    for obj in oss2.ObjectIteratorV2(bucket, prefix=prefix, delimiter=delimiter, max_keys=1000):
+        if obj.key.endswith("/") and obj.size is None:
+            prefixes.append(obj.key)
+        else:
+            record = _object_record(obj, source)
+            if record is not None:
+                objects.append(record)
+    return objects, prefixes
+
+
+def _list_exact(bucket, source: str, key: str) -> dict | None:
+    # Prefix listing is used instead of HEAD because existing jobs only need List/Get permissions.
+    for obj in oss2.ObjectIteratorV2(bucket, prefix=key, max_keys=1):
+        if obj.key == key:
+            return _object_record(obj, source)
+    return None
+
+
+def _list_numeric_chunks(bucket, source: str, prefix: str) -> list[dict]:
+    """List a flat c/ chunk directory in parallel, including keys outside decimal prefixes.
+
+    Decimal first characters are disjoint OSS prefixes. The two edge scans cover every other
+    possible key, so this still enumerates all objects rather than assuming a particular layout.
+    """
+    def before_digits() -> list[dict]:
+        objects = []
+        for obj in oss2.ObjectIteratorV2(bucket, prefix=prefix, max_keys=1000):
+            if obj.key >= f"{prefix}0":
+                break
+            record = _object_record(obj, source)
+            if record is not None:
+                objects.append(record)
+        return objects
+
+    def after_digits() -> list[dict]:
+        objects = []
+        for obj in oss2.ObjectIteratorV2(bucket, prefix=prefix, start_after=f"{prefix}:", max_keys=1000):
+            record = _object_record(obj, source)
+            if record is not None:
+                objects.append(record)
+        return objects
+
+    with ThreadPoolExecutor(max_workers=13) as executor:
+        futures = [executor.submit(_list_prefix, bucket, source, f"{prefix}{digit}")
+                   for digit in "0123456789"]
+        before = executor.submit(before_digits)
+        colon = executor.submit(_list_exact, bucket, source, f"{prefix}:")
+        after = executor.submit(after_digits)
+        objects = [obj for future in futures for obj in future.result()[0]]
+        objects.extend(before.result())
+        if (record := colon.result()) is not None:
+            objects.append(record)
+        objects.extend(after.result())
+    return objects
+
+
+def _list_array(bucket, source: str, prefix: str) -> list[dict]:
+    # The spectra array dominates max_2 (tens of thousands of chunks). Split its c/ keys so
+    # one array does not turn the otherwise parallel listing back into a serial page chain.
+    if prefix != f"{source}/spectra/intensity/":
+        return _list_prefix(bucket, source, prefix)[0]
+    direct, children = _list_prefix(bucket, source, prefix, delimiter="/")
+    chunk_prefix = f"{prefix}c/"
+    if chunk_prefix in children:
+        children.remove(chunk_prefix)
+        direct.extend(_list_numeric_chunks(bucket, source, chunk_prefix))
+    for child in children:
+        direct.extend(_list_prefix(bucket, source, child)[0])
+    return direct
+
+
+def list_source_objects(bucket, source: str, skip_ion_image_chunks: bool = False) -> tuple[list[dict], bool]:
+    """Discover Zarr groups, then list their arrays concurrently.
+
+    The boolean reports that chunk keys were never enumerated, so their count and size are unknown.
+    """
+    with ThreadPoolExecutor(max_workers=LIST_WORKERS) as executor:
+        root_future = executor.submit(_list_prefix, bucket, source, f"{source}/", "/")
+        spectra_keys = [f"{source}/spectra/intensity/{name}" for name in ("zarr.json", ".zarray")]
+        spectra_futures = [executor.submit(_list_exact, bucket, source, key) for key in spectra_keys] \
+            if skip_ion_image_chunks else []
+        intensity = f"{source}/ion_image/intensity/"
+        metadata_futures = [executor.submit(_list_exact, bucket, source, f"{intensity}{name}")
+                            for name in sorted(ZARR_METADATA_FILES)] if skip_ion_image_chunks else []
+        root_objects, groups = root_future.result()
+        group_listings = list(executor.map(lambda prefix: _list_prefix(bucket, source, prefix, "/"), groups))
+        direct_objects = [obj for group_objects, _ in group_listings for obj in group_objects]
+        arrays = [prefix for _, prefixes in group_listings for prefix in prefixes]
+        can_skip = skip_ion_image_chunks and any(future.result() for future in spectra_futures)
+        excluded = can_skip and intensity in arrays
+        if excluded:
+            direct_objects.extend(obj for future in metadata_futures if (obj := future.result()) is not None)
+            arrays.remove(intensity)
+        array_listings = list(executor.map(lambda prefix: _list_array(bucket, source, prefix), arrays))
+    objects = sorted(root_objects + direct_objects + [obj for group in array_listings for obj in group],
+                     key=lambda obj: obj["key"])
     if not objects:
         raise FileNotFoundError(f"no objects under {source}/; check umap.source_zarr_path")
-    return objects
+    return objects, excluded
 
 
 def split_download_objects(objects: list[dict], source: str, skip_ion_image_chunks: bool) -> tuple[list, list]:
@@ -207,13 +310,17 @@ def _parallel(function, items: list) -> list:
     return results
 
 
-def download_objects(bucket, objects: list[dict], source: str, destination: Path) -> int:
+def download_objects(bucket, objects: list[dict], source: str, destination: Path,
+                     workers: int = DEFAULT_DOWNLOAD_WORKERS) -> int:
     """Download with If-Match on the listed ETag; a file appears only after its size and ETag match."""
     destination.mkdir(parents=True, exist_ok=True)
     # Partial files live outside the Zarr so they can never collide with a real object name.
     parts = Path(tempfile.mkdtemp(prefix="parts-", dir=destination.parent))
+    stop = threading.Event()
 
     def download_one(obj: dict) -> int:
+        if stop.is_set():
+            return 0
         target = destination / obj["key"][len(source) + 1:]
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=parts)
@@ -222,13 +329,32 @@ def download_objects(bucket, objects: list[dict], source: str, destination: Path
             result = bucket.get_object_to_file(obj["key"], temporary, headers={"If-Match": f'"{obj["etag"]}"'})
             if os.path.getsize(temporary) != obj["size"] or result.etag != obj["etag"]:
                 raise IOError(f"source changed during download: {obj['key']}")
-            os.replace(temporary, target)
+            if not stop.is_set():
+                os.replace(temporary, target)
             return obj["size"]
         finally:
             Path(temporary).unlink(missing_ok=True)
 
     try:
-        return sum(_parallel(download_one, objects))
+        total = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {executor.submit(download_one, obj) for obj in objects[:workers]}
+            remaining = iter(objects[workers:])
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                # Inspect all completed tasks before submitting more. An error stops the stream.
+                failure = next((future.exception() for future in done if future.exception() is not None), None)
+                if failure is not None:
+                    stop.set()
+                    for future in pending:
+                        future.cancel()
+                    raise failure
+                total += sum(future.result() for future in done)
+                for _ in done:
+                    obj = next(remaining, None)
+                    if obj is not None:
+                        pending.add(executor.submit(download_one, obj))
+        return total
     finally:
         shutil.rmtree(parts, ignore_errors=True)
 

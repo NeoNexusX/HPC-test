@@ -31,6 +31,8 @@ class BatchTests(unittest.TestCase):
                     {"runs": [{"config": ""}]}, {"runs": [{"config": "c", "repeat": 0}]},
                     {"runs": [{"config": "c", "repeat": 1.5}]}, {"runs": [{"config": "c", "repeat": True}]},
                     {"runs": [{"config": "c", "instance_types": []}]},
+                    {"runs": [{"config": "c", "resources": {"cores": 0}}]},
+                    {"runs": [{"config": "c", "resources": {"gpu": 1}}]},
                     {"runs": [{"config": "c", "other": 1}]},
                     {"batch_name": "bad name", "runs": [{"config": "c"}]}]:
             with self.assertRaises(ValueError, msg=bad):
@@ -63,6 +65,18 @@ class BatchTests(unittest.TestCase):
                                      "20260101T000000Z-abcdef12")
         self.assertEqual(cells[0]["config"]["umap"]["source_zarr_path"], "other/set.zarr")
 
+    def test_resource_override_applies_to_each_cell_and_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_config(directory)
+            cells = run_batch.expand({"runs": [{"config": str(path),
+                "instance_types": ["ecs.c7.large"],
+                "resources": {"cores": 2, "memory_gib": 4, "system_disk_gib": 80}}]},
+                "20260101T000000Z-abcdef12")
+        resources = cells[0]["config"]["resources"]
+        self.assertEqual((resources["cores"], resources["memory_gib"], resources["system_disk_gib"]),
+                         (2, 4, 80))
+        self.assertEqual(cells[0]["config"]["umap"]["benchmark_labels"]["cores"], 2)
+
     def test_run_ids_are_unique_and_valid(self):
         with tempfile.TemporaryDirectory() as directory:
             path = write_config(directory)
@@ -80,12 +94,18 @@ class BatchTests(unittest.TestCase):
             spec_path.write_text(json.dumps({"batch_name": "bench", "runs": [
                 {"config": str(path), "instance_types": ["ecs.c7.large", "ecs.g7.large"], "repeat": 1}]}))
             seen = []
+            progress_seen = []
 
             def fake_submit(cfg, run_id, args, **_):
                 seen.append((run_id, cfg["resources"]["instance_types"][0]))
+                progress_path = next((Path(directory) / "work").glob("*/batch_progress.json"))
+                progress_seen.append(json.loads(progress_path.read_text()))
                 # first cell fails, second passes: the batch must continue and record both
                 code = 0 if len(seen) == 2 else 2
-                return code, {"job_id": f"job-{len(seen)}", "oss_prefix": "oss://b/x/", "results": "oss://b/x/"}
+                # the second cell's type sold out and fell back to any type
+                submitted = "any" if len(seen) == 2 else [seen[-1][1]]
+                return code, {"job_id": f"job-{len(seen)}", "oss_prefix": "oss://b/x/", "results": "oss://b/x/",
+                              "instance_types": submitted}
 
             argv = ["run_batch.py", "--batch", str(spec_path), "--env-file", str(Path(directory) / "missing.env")]
             with patch.object(sys, "argv", argv), patch.object(run_batch, "ROOT", Path(directory)), \
@@ -94,11 +114,14 @@ class BatchTests(unittest.TestCase):
                 code = run_batch.main()
             self.assertEqual(code, 1)  # not every cell passed
             self.assertEqual([t for _, t in seen], ["ecs.c7.large", "ecs.g7.large"])
+            self.assertEqual([p["current"]["run_id"] for p in progress_seen], [r for r, _ in seen])
+            self.assertEqual([p["completed"] for p in progress_seen], [0, 1])
             summaries = list((Path(directory) / "work").glob("*/batch_summary.json"))
             self.assertEqual(len(summaries), 1)
             data = json.loads(summaries[0].read_text())
             self.assertEqual((data["total"], data["passed"], data["failed"]), (2, 1, 1))
             self.assertEqual([r["exit_code"] for r in data["runs"]], [2, 0])
+            self.assertEqual([r["submitted_instance_types"] for r in data["runs"]], [["ecs.c7.large"], "any"])
 
     def test_dry_run_plans_without_submitting(self):
         with tempfile.TemporaryDirectory() as directory:

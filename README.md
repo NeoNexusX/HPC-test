@@ -130,7 +130,7 @@ Bucket 概览里的“文件可以被公共访问”，意思是没有开启“�
    - **省事**：选系统策略 `AliyunEHPCFullAccess` 和 `AliyunSTSAssumeRoleAccess`。
    - **最小权限**：粘贴 [config/submit-policy.example.json](config/submit-policy.example.json)，把 `<account-id>` 和 `<oss-benchmark-role>` 换成实际值，创建为自定义策略后授权。它只允许 `ehpc:CreateJob`、`ehpc:GetJob`，以及扮演 3.1 的那一个角色。
 
-这个用户没有 OSS 权限，所以查看结果请用主账号登录 OSS 控制台。
+这个用户没有 OSS 权限。操作台的运行记录通过扮演 3.1 的角色读取结果（会话策略只允许列举和读取 `oss_prefix` 下的对象）；也可以用主账号登录 OSS 控制台查看。
 
 ### 4. E-HPC INSTANT 与香港 VPC
 
@@ -186,13 +186,14 @@ cp .env.example .env && chmod 600 .env                     # 已被 .gitignore �
 | `enable_external_ip` | 是否给作业分配公网 IP，默认 `false` |
 | `oss_role_arn` | 第 3.1 步的角色 ARN |
 | `resources.cores` / `memory_gib` / `system_disk_gib` | 作业规格。当前使用 `ecs.c9a.xlarge`：4 核 / 8 GiB / 100 GiB。系统盘要能装下下载量再加 1 GiB 余量；内存要覆盖 UMAP 峰值（测试数据约 1 GiB，见 `run.log` 的 `peak_rss`） |
-| `resources.instance_types`（可选） | 最多 5 个实例规格，例如 `["ecs.g7.large"]`，用于固定 CPU 代际。按顺序尝试，全部售罄时作业不会自动改用其他规格。不写时 INSTANT 会按核数和内存自选规格，成功率最高 |
-| `resources.fallback_any_type`（可选） | 默认 `false`。设为 `true` 时，如果 CreateJob 返回售罄错误（如 `RecommendEmpty.InstanceTypeSoldOut`），会去掉 `instance_types` 再提交一次，改由 INSTANT 自选规格。只对这一种错误重试，此时服务端没有创建作业，所以不会重复运行 |
+| `resources.instance_types`（可选） | 最多 5 个候选实例规格，例如 `["ecs.g7.large"]`，用于固定 CPU 代际（只在 `AllocationSpec=Standard` 时生效，本项目固定用 Standard）。填了规格后，机器的 CPU 和内存以规格为准：`GetJob` 返回的作业资源里只剩 `InstanceTypes` 和系统盘，不再有 `Cores`/`Memory`。候选规格全部售罄时 CreateJob 直接返回 `403 RecommendEmpty.InstanceTypeSoldOut`，不创建作业，阿里云不会自动改用其他规格。不写时 INSTANT 按核数和内存自选规格，成功率最高 |
+| `resources.fallback_any_type`（可选） | 默认 `false`。设为 `true` 时，如果 CreateJob 返回售罄错误（如 `RecommendEmpty.InstanceTypeSoldOut`），会去掉 `instance_types` 再提交一次，改由 INSTANT 按 `cores`/`memory_gib` 自选规格。只对这一种错误重试，此时服务端没有创建作业，所以不会重复运行。这是本项目在客户端实现的，INSTANT 没有对应开关；作业已创建、之后才因资源不足失败的情况不会触发回退。批量作业回退时，结果标签里的 `instance_type` 改记为 `any`，原规格记在 `sold_out_instance_types` |
 | `umap.oss_*` | Bucket（`official-oss`）、地域、内网 Endpoint、结果归档前缀（`ehpc-benchmark`） |
 | `umap.source_zarr_path` | 数据集的 OSS 前缀（不含 bucket，以 `.zarr` 结尾），当前为 `ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr`。`--dataset` 可临时覆盖 |
 | `umap.write_back` | 默认 `false`：结果放到本次 run 的 `zarr-delta/`，数据集只读。`true`：与 FC 一样把 `analysis/umap` 写回源 Zarr，会话策略只额外放开 `<数据集>/analysis/*` 的写入 |
 | `umap.work_dir` | 容器内下载和计算目录，默认 `/tmp/umap-work`（系统盘）。不要指向 `/dev` 或 `/` |
 | `umap.skip_ion_image_chunks` | 默认 `true`，跳过 `ion_image/intensity` 数据块（测试数据可少下载约 40%）。`false` 为完整下载 |
+| `umap.download_workers`（可选） | 同时下载的 OSS 对象数，默认 32，可设 1–128；连接池容量至少与之相同 |
 | `umap.full_matrix_mib` / `sample_matrix_mib` / `max_fit_samples` | 同 FC：float32 矩阵不超过 `full_matrix_mib`（1024）时全量拟合；超过时抽样，样本数不超过 `max_fit_samples`（20000）且样本矩阵不超过 `sample_matrix_mib`（1024） |
 
 **`.env`（秘密）**：提交脚本每次运行都会自动读取，不需要手动 `export`。终端里已经 export 的同名变量优先。
@@ -206,6 +207,20 @@ ALIBABA_CLOUD_ECS_METADATA_DISABLED=true
 ```
 
 `.env` 和 `config/instant.local.json` 都已被 `.gitignore` 排除，也被 `.dockerignore` 排除，不会进入 Git 或镜像。
+
+### Vue 操作台
+
+在仓库根目录安装 Python 依赖并构建前端，然后启动只监听本机的服务：
+
+```bash
+pip install -r requirements.txt
+cd frontend && npm install && npm run build && cd ..
+python3 scripts/ui_server.py
+```
+
+打开 `http://127.0.0.1:8765`。开发前端时可在 `frontend/` 运行 `npm run dev`，Vite 会把 `/api` 转发到本机 8765 端口。操作台可编辑单次作业配置、`config/batch.local.json` 的有序批量序列和 `.env`。配置中心可切换已有的 INSTANT 配置文件，也可把当前已保存的配置复制为新的 `config/*.local.json` 文件供批量序列使用。首次没有本地文件时使用 example 作为编辑起点，保存后才会写入本地文件。批量示例里的 `config/instant.big.json` 仅是示范路径，运行前须改成已有配置或在配置中心创建该文件。
+
+服务只监听 `127.0.0.1`，环境变量页直接显示 `.env` 和进程中的实际值，修改时写入权限为 `600` 的 `.env`。通过操作台新启动的作业以 `.env` 中的值为准；直接运行命令行脚本时，已导出的同名 shell 变量仍优先。运行记录直接读取 OSS 归档，不看本地 `work/`：配置文件里 `umap.oss_prefix` 下每个含 `manifest.json` 的结果文件夹就是一条记录，无论作业从哪台机器提交（`manifest.json` 最后上传，有它说明结果已完整归档）。列表按分组文件夹筛选，服务端缓存 60 秒，点“重新读取 OSS”立即刷新；详情显示 CPU、耗时、峰值内存、结果图和 `run.log`，可以逐个下载文件，也可以把单条、一个分组或全部记录（含 `zarr-delta`）打包成 zip 下载。读取用的是扮演 `oss_role_arn` 得到的只读临时凭证。从本页启动的作业在运行中和结束后 1 小时内单独显示本地输出与批量进度，并查询 INSTANT 的 `GetJob` 状态。配置文件列表和批量序列每 5 秒与磁盘同步，在界面外删除的配置文件会从下拉框消失，未保存的批量编辑不会被覆盖。等待超时只结束本地等待，云端作业不会因此取消。容器内的 `run.log` 仍归档在 OSS，不会在运行中从本地操作台实时读取。
 
 ## 二、运行
 
@@ -244,6 +259,7 @@ python scripts/run_batch.py --batch config/batch.local.json --wait-timeout 1800
 | `instance_types`（可选） | 要逐个测试的实例型号列表，例如 `["ecs.c7.large", "ecs.g7.large"]`。每个型号会被单独钉住成一个作业（`resources.instance_types=[该型号]`），结果里能明确记录跑的是哪个型号。不写则回退到 `config` 里的 `resources.instance_types`；再没有就交给 INSTANT 自选（记为 `any`） |
 | `repeat`（可选） | 每个型号跑几遍，默认 1，上限 100 |
 | `dataset`（可选） | 临时覆盖该组的数据集，等同单发的 `--dataset` |
+| `resources`（可选） | 覆盖该组的 `cores` / `memory_gib` / `system_disk_gib`（正整数），不写则继承 `config`。钉住型号时机器的 CPU 和内存以型号为准，这两项只写进结果标签，售罄回退改为自选时也按它们选机器，所以最好与型号一致；系统盘总是按这里申请。INSTANT 接口没有 GPU 字段，要用 GPU 只能填 GPU 实例型号 |
 
 **一次批量 = 一个 OSS 文件夹。** 每次运行 `run_batch.py` 会生成一个 `batch_id`，本次所有作业的结果都归到同一个批次文件夹下：
 
@@ -295,7 +311,7 @@ oss://<bucket>/<oss_prefix>/<batch_id>/<run_id>/<attempt-id>/{result.json, run.l
 ... packages massflow=0.1.2 umap-learn=... pynndescent=... numba=... numpy=... scikit-learn=... zarr=...
 ... cpu model: <型号> (<厂商>, x86_64)
 ... disk work_dir=/tmp/umap-work total=100.0GiB free=98.7GiB
-... dataset oss://official-oss/ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr/ objects=239 size=50.3MiB download=29.9MiB skipped_ion_image_chunks=70
+... dataset oss://official-oss/ehpc-benchmark/test_data/1e2de4_Mouse_Heart_MALDI_50_Negative.zarr/ listed_objects=... listed_size=...MiB download=29.9MiB excluded_ion_image_chunks=True
 ... finish download ...s
 ... finish umap 10.1s
 ... umap pixels=20346 features=836 matrix=64.9MiB fit_samples=20346 sample_ratio=1.000000
@@ -304,10 +320,15 @@ oss://<bucket>/<oss_prefix>/<batch_id>/<run_id>/<attempt-id>/{result.json, run.l
 ... throughput compute=64.9MiB in 10.1s (...MiB/s, ...px/s)
 ... throughput upload=...MiB in ...s (...MiB/s)
 ... cleaned local dataset copy /tmp/umap-work/<数据集>.zarr after successful upload
+... timings list_seconds=...s massflow_import_seconds=...s download_seconds=...s import_download_overlap_seconds=...s list_to_umap_seconds=...s pipeline_seconds=...s
 ... umap_pass=True peak_rss=974.9MiB stages_seconds={'list': ..., 'download': ..., 'import': ..., 'umap': ..., 'upload': ...}
 ```
 
 `result.json` 里对应的 `throughput` 记录了三个数据阶段的**时间和速度**：`download`（下载 MiB 与 MiB/s）、`compute`（UMAP 处理的矩阵 MiB、像素数，以及 MiB/s、px/s）、`upload`（上传 MiB 与 MiB/s）；`disk` 记录了本次作业所在机器的磁盘配置。上传成功后会立即删除本地下载/计算产生的副本以释放磁盘，这步在计时之外，不计入 `stages_seconds`。
+
+`result.json.timings` 单独记录 OSS 列举、MassFlow 导入、实际下载、导入与下载重叠时间、从列举开始到可以运行 UMAP 的时间，以及从列举开始到结果上传完成的流水线墙钟时间。`dataset.planned_download_objects` / `planned_download_bytes` 是列举后预计下载量；`downloaded_objects` / `downloaded_bytes` 只在所有下载完成且校验通过后写入实际值。下载计时不包括列举、MassFlow 导入和 UMAP 计算；流水线计时不包括后续日志归档。
+
+列举先发现 Zarr 顶层数组，再并行列举各数组；`spectra/intensity/c/` 的块键还会按首字符分片并行列举，以免一个大数组的分页拖慢整体。启用跳过选项且存在 `spectra/intensity` 元数据时，只查询 `ion_image/intensity` 的元数据，不逐个列举其数据块。因此 `dataset.objects`、`dataset.bytes` 只统计实际列出的对象，`dataset.total_objects_known=false`，`dataset.skipped_ion_image_chunks=null` 表示跳过块的精确数量未知。`import` 与 `download` 同时运行，两项阶段耗时会重叠，不能相加当作总墙钟时间。
 
 以上内容同时输出到容器 stdout，可以在 INSTANT 控制台的作业日志里看到。
 
